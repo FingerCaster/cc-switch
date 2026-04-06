@@ -1,4 +1,5 @@
 export type UsageTimeRangePreset =
+  | "allTime"
   | "today"
   | "yesterday"
   | "last24Hours"
@@ -15,6 +16,11 @@ export interface UsageTimeRangeValue {
   endDate: number;
 }
 
+export interface UsageTimeRangeQueryWindow {
+  startDate?: number;
+  endDate?: number;
+}
+
 export const MAX_USAGE_TIME_RANGE_SECONDS = 30 * 24 * 60 * 60;
 
 export interface UsageTimeRangePresetOption {
@@ -24,6 +30,7 @@ export interface UsageTimeRangePresetOption {
 }
 
 export const USAGE_TIME_RANGE_PRESET_OPTIONS: UsageTimeRangePresetOption[] = [
+  { preset: "allTime", labelKey: "usage.range.allTime", fallback: "全部用量" },
   { preset: "today", labelKey: "usage.range.today", fallback: "今天" },
   { preset: "yesterday", labelKey: "usage.range.yesterday", fallback: "昨天" },
   {
@@ -63,6 +70,12 @@ const startOfLocalDay = (date: Date) =>
     0,
   );
 
+const startOfNextLocalDay = (date: Date) => {
+  const nextDay = new Date(date);
+  nextDay.setDate(nextDay.getDate() + 1);
+  return startOfLocalDay(nextDay);
+};
+
 const endOfLocalDay = (date: Date) =>
   new Date(
     date.getFullYear(),
@@ -87,11 +100,17 @@ export function getUsageTimeRangeValue(
   const now = nowInput ? new Date(nowInput) : new Date(Date.now());
 
   switch (preset) {
+    case "allTime":
+      return {
+        preset,
+        startDate: 0,
+        endDate: 0,
+      };
     case "today":
       return {
         preset,
         startDate: toUnix(startOfLocalDay(now)),
-        endDate: toUnix(now),
+        endDate: toUnix(startOfNextLocalDay(now)),
       };
     case "yesterday": {
       const yesterday = new Date(now);
@@ -158,11 +177,26 @@ export function resolveUsageTimeRangeValue(
   range: UsageTimeRangeValue,
   nowInput?: Date,
 ): UsageTimeRangeValue {
-  if (range.preset === "custom") {
+  if (range.preset === "custom" || range.preset === "allTime") {
     return range;
   }
 
   return getUsageTimeRangeValue(range.preset, nowInput);
+}
+
+export function getUsageTimeRangeQueryWindow(
+  range: UsageTimeRangeValue,
+  nowInput?: Date,
+): UsageTimeRangeQueryWindow {
+  if (range.preset === "allTime") {
+    return {};
+  }
+
+  const resolvedRange = resolveUsageTimeRangeValue(range, nowInput);
+  return {
+    startDate: resolvedRange.startDate,
+    endDate: resolvedRange.endDate,
+  };
 }
 
 export function isUsageTimeRangeWithinLimit(range: UsageTimeRangeValue): boolean {

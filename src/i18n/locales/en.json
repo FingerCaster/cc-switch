@@ -1073,6 +1073,8 @@
     "invalidTimeRangeOrder": "Start time cannot be later than end time",
     "timeRangeTooLarge": "Time range is too large, please narrow it down",
     "range": {
+      "allTime": "All Usage",
+      "allTimeHint": "Include all historical data",
       "today": "Today",
       "todayWithUnit": "Today (hourly)",
       "yesterday": "Yesterday",

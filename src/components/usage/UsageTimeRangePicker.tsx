@@ -14,6 +14,7 @@ import {
   getUsageTimeRangeValue,
   isUsageTimeRangeWithinLimit,
   localDatetimeToTimestamp,
+  resolveUsageTimeRangeValue,
   timestampToLocalDatetime,
   USAGE_TIME_RANGE_PRESET_OPTIONS,
   type UsageTimeRangePreset,
@@ -56,9 +57,10 @@ export function UsageTimeRangePicker({
       : (presetLabelMap.get(value.preset) ?? t("usage.range.today", "今天"));
 
   const syncDraftWithValue = () => {
+    const resolvedValue = resolveUsageTimeRangeValue(value);
     setDraftPreset(value.preset);
-    setDraftStartDate(value.startDate);
-    setDraftEndDate(value.endDate);
+    setDraftStartDate(resolvedValue.startDate);
+    setDraftEndDate(resolvedValue.endDate);
     setValidationError(null);
   };
 
@@ -80,9 +82,11 @@ export function UsageTimeRangePicker({
   };
 
   const handleApply = () => {
+    const requiresExplicitDateBounds = draftPreset !== "allTime";
+
     if (
-      typeof draftStartDate !== "number" ||
-      typeof draftEndDate !== "number"
+      requiresExplicitDateBounds &&
+      (typeof draftStartDate !== "number" || typeof draftEndDate !== "number")
     ) {
       setValidationError(
         t("usage.invalidTimeRange", "请选择完整的开始/结束时间"),
@@ -90,7 +94,7 @@ export function UsageTimeRangePicker({
       return;
     }
 
-    if (draftStartDate > draftEndDate) {
+    if (requiresExplicitDateBounds && draftStartDate > draftEndDate) {
       setValidationError(
         t("usage.invalidTimeRangeOrder", "开始时间不能晚于结束时间"),
       );
@@ -100,11 +104,7 @@ export function UsageTimeRangePicker({
     const nextValue =
       draftPreset === "custom"
         ? buildCustomUsageTimeRange(draftStartDate, draftEndDate)
-        : {
-            preset: draftPreset,
-            startDate: draftStartDate,
-            endDate: draftEndDate,
-          };
+        : getUsageTimeRangeValue(draftPreset);
 
     if (!isUsageTimeRangeWithinLimit(nextValue)) {
       setValidationError(
@@ -135,7 +135,10 @@ export function UsageTimeRangePicker({
           <ChevronDown className="h-4 w-4" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-[360px] rounded-2xl p-0" align="end">
+      <PopoverContent
+        className="w-[min(420px,calc(100vw-2rem))] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl p-0"
+        align="end"
+      >
         <div className="space-y-4 p-4">
           <div className="space-y-1">
             <div className="text-sm font-medium">
@@ -164,43 +167,51 @@ export function UsageTimeRangePicker({
             })}
           </div>
 
-          <div className="grid grid-cols-[1fr_auto_1fr] items-end gap-3">
-            <div className="space-y-2">
-              <label className="text-sm text-muted-foreground">
-                {t("usage.range.startDate", "开始日期")}
-              </label>
-              <Input
-                type="datetime-local"
-                value={timestampToLocalDatetime(draftStartDate)}
-                onChange={(e) => {
-                  const next = localDatetimeToTimestamp(e.target.value);
-                  if (typeof next === "number") {
-                    setDraftPreset("custom");
-                    setDraftStartDate(next);
-                  }
-                }}
-              />
+          {draftPreset === "allTime" ? (
+            <div className="rounded-xl border border-dashed bg-muted/10 px-4 py-3 text-sm text-muted-foreground">
+              {t("usage.range.allTimeHint", "统计全部历史数据")}
             </div>
-            <div className="pb-2 text-muted-foreground">
-              <ArrowRight className="h-4 w-4" />
+          ) : (
+            <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+              <div className="min-w-0 space-y-2">
+                <label className="text-sm text-muted-foreground">
+                  {t("usage.range.startDate", "开始日期")}
+                </label>
+                <Input
+                  type="datetime-local"
+                  className="min-w-0 text-xs sm:text-sm"
+                  value={timestampToLocalDatetime(draftStartDate)}
+                  onChange={(e) => {
+                    const next = localDatetimeToTimestamp(e.target.value);
+                    if (typeof next === "number") {
+                      setDraftPreset("custom");
+                      setDraftStartDate(next);
+                    }
+                  }}
+                />
+              </div>
+              <div className="flex justify-center pb-0 text-muted-foreground sm:pb-2">
+                <ArrowRight className="h-4 w-4" />
+              </div>
+              <div className="min-w-0 space-y-2">
+                <label className="text-sm text-muted-foreground">
+                  {t("usage.range.endDate", "结束日期")}
+                </label>
+                <Input
+                  type="datetime-local"
+                  className="min-w-0 text-xs sm:text-sm"
+                  value={timestampToLocalDatetime(draftEndDate)}
+                  onChange={(e) => {
+                    const next = localDatetimeToTimestamp(e.target.value);
+                    if (typeof next === "number") {
+                      setDraftPreset("custom");
+                      setDraftEndDate(next);
+                    }
+                  }}
+                />
+              </div>
             </div>
-            <div className="space-y-2">
-              <label className="text-sm text-muted-foreground">
-                {t("usage.range.endDate", "结束日期")}
-              </label>
-              <Input
-                type="datetime-local"
-                value={timestampToLocalDatetime(draftEndDate)}
-                onChange={(e) => {
-                  const next = localDatetimeToTimestamp(e.target.value);
-                  if (typeof next === "number") {
-                    setDraftPreset("custom");
-                    setDraftEndDate(next);
-                  }
-                }}
-              />
-            </div>
-          </div>
+          )}
 
           {validationError ? (
             <div className="text-sm text-red-600">{validationError}</div>

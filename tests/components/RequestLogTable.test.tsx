@@ -132,12 +132,71 @@ describe("RequestLogTable", () => {
       expect(firstFilters.startDate - filters.startDate).toBeGreaterThanOrEqual(
         5 * 24 * 60 * 60,
       );
-      expect(filters.endDate).toBeGreaterThanOrEqual(firstFilters.endDate);
+      expect(typeof filters.endDate).toBe("number");
     },
     10000,
   );
 
-  it("refreshes relative time presets using the latest current time", async () => {
+  it("refreshes rolling presets using the latest current time", async () => {
+    let currentTime = new Date("2026-04-06T08:00:00+08:00").getTime();
+    vi.spyOn(Date, "now").mockImplementation(() => currentTime);
+
+    const requests: Array<Record<string, unknown>> = [];
+
+    server.use(
+      http.post(`${TAURI_ENDPOINT}/get_request_logs`, async ({ request }) => {
+        requests.push((await request.json()) as Record<string, unknown>);
+
+        return HttpResponse.json({
+          data: [],
+          total: 0,
+          page: 0,
+          pageSize: 20,
+        });
+      }),
+    );
+
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: {
+          retry: false,
+        },
+      },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <RequestLogTable refreshIntervalMs={0} />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(requests.length).toBe(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "今天" }));
+    fireEvent.click(screen.getByRole("button", { name: "近 24 小时" }));
+    fireEvent.click(screen.getByRole("button", { name: "应用" }));
+
+    await waitFor(() => expect(requests.length).toBeGreaterThan(1));
+
+    const rollingFilters = requests.at(-1)?.filters as Record<string, number>;
+    currentTime = new Date("2026-04-06T10:00:00+08:00").getTime();
+
+    await client.invalidateQueries({ queryKey: ["usage", "logs"] });
+
+    await waitFor(() => expect(requests.length).toBeGreaterThan(1));
+
+    const latestFilters = requests.at(-1)?.filters as Record<string, number>;
+
+    expect(latestFilters.startDate).toBeGreaterThan(rollingFilters.startDate);
+    expect(latestFilters.endDate).toBeGreaterThan(rollingFilters.endDate);
+    expect(
+      latestFilters.endDate - rollingFilters.endDate,
+    ).toBeGreaterThanOrEqual(
+      2 * 60 * 60,
+    );
+  }, 10000);
+
+  it("keeps today pinned to the full calendar day while refreshes continue", async () => {
     let currentTime = new Date("2026-04-06T08:00:00+08:00").getTime();
     vi.spyOn(Date, "now").mockImplementation(() => currentTime);
 
@@ -173,6 +232,13 @@ describe("RequestLogTable", () => {
     await waitFor(() => expect(requests.length).toBe(1));
 
     const firstFilters = requests[0]?.filters as Record<string, number>;
+    expect(firstFilters.startDate).toBe(
+      Math.floor(new Date("2026-04-06T00:00:00+08:00").getTime() / 1000),
+    );
+    expect(firstFilters.endDate).toBe(
+      Math.floor(new Date("2026-04-07T00:00:00+08:00").getTime() / 1000),
+    );
+
     currentTime = new Date("2026-04-06T10:00:00+08:00").getTime();
 
     await client.invalidateQueries({ queryKey: ["usage", "logs"] });
@@ -182,9 +248,50 @@ describe("RequestLogTable", () => {
     const latestFilters = requests.at(-1)?.filters as Record<string, number>;
 
     expect(latestFilters.startDate).toBe(firstFilters.startDate);
-    expect(latestFilters.endDate).toBeGreaterThan(firstFilters.endDate);
-    expect(latestFilters.endDate - firstFilters.endDate).toBeGreaterThanOrEqual(
-      2 * 60 * 60,
+    expect(latestFilters.endDate).toBe(firstFilters.endDate);
+  }, 10000);
+
+  it("queries all history when the all-time preset is selected", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+
+    server.use(
+      http.post(`${TAURI_ENDPOINT}/get_request_logs`, async ({ request }) => {
+        requests.push((await request.json()) as Record<string, unknown>);
+
+        return HttpResponse.json({
+          data: [],
+          total: 0,
+          page: 0,
+          pageSize: 20,
+        });
+      }),
     );
+
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: {
+          retry: false,
+        },
+      },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <RequestLogTable refreshIntervalMs={0} />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(requests.length).toBe(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "今天" }));
+    fireEvent.click(screen.getByRole("button", { name: "全部用量" }));
+    fireEvent.click(screen.getByRole("button", { name: "应用" }));
+
+    await waitFor(() => expect(requests.length).toBeGreaterThan(1));
+
+    const latestFilters = requests.at(-1)?.filters as Record<string, unknown>;
+
+    expect(latestFilters.startDate).toBeUndefined();
+    expect(latestFilters.endDate).toBeUndefined();
   }, 10000);
 });

@@ -108,7 +108,9 @@ export function UsageTrendChart({
           {t("usage.trends", "使用趋势")}
         </h3>
         <p className="text-sm text-muted-foreground">
-          {range.preset === "today"
+          {range.preset === "allTime"
+            ? t("usage.range.allTime", "全部用量")
+            : range.preset === "today"
             ? t("usage.range.todayWithUnit", "今天（按小时）")
             : t("usage.range.selected", "所选时间范围")}
         </p>

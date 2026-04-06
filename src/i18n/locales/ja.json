@@ -1073,6 +1073,8 @@
     "invalidTimeRangeOrder": "開始時刻は終了時刻より前である必要があります",
     "timeRangeTooLarge": "時間範囲が大きすぎます。範囲を縮小してください",
     "range": {
+      "allTime": "全期間",
+      "allTimeHint": "すべての履歴データを集計します",
       "today": "今日",
       "todayWithUnit": "今日（時間別）",
       "yesterday": "昨日",

@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { usageApi } from "@/lib/api/usage";
 import type { LogFilters } from "@/types/usage";
 import {
-  resolveUsageTimeRangeValue,
+  getUsageTimeRangeQueryWindow,
   type UsageTimeRangeValue,
 } from "@/components/usage/timeRange";
 
@@ -23,12 +23,12 @@ type RequestLogsQueryArgs = {
 
 type RequestLogsKey = {
   preset: UsageTimeRangeValue["preset"];
+  rangeStartDate: number;
+  rangeEndDate: number;
   appType?: string;
   providerName?: string;
   model?: string;
   statusCode?: number;
-  startDate?: number;
-  endDate?: number;
 };
 
 // Query keys
@@ -45,12 +45,12 @@ export const usageKeys = {
       ...usageKeys.all,
       "logs",
       key.preset,
+      key.rangeStartDate,
+      key.rangeEndDate,
       key.appType ?? "",
       key.providerName ?? "",
       key.model ?? "",
       key.statusCode ?? -1,
-      key.startDate ?? 0,
-      key.endDate ?? 0,
       page,
       pageSize,
     ] as const,
@@ -69,7 +69,7 @@ export function useUsageSummary(
   return useQuery({
     queryKey: usageKeys.summary(range.startDate, range.endDate),
     queryFn: () => {
-      const resolvedRange = resolveUsageTimeRangeValue(range);
+      const resolvedRange = getUsageTimeRangeQueryWindow(range);
       return usageApi.getUsageSummary(
         resolvedRange.startDate,
         resolvedRange.endDate,
@@ -87,7 +87,7 @@ export function useUsageTrends(
   return useQuery({
     queryKey: usageKeys.trends(range.startDate, range.endDate),
     queryFn: () => {
-      const resolvedRange = resolveUsageTimeRangeValue(range);
+      const resolvedRange = getUsageTimeRangeQueryWindow(range);
       return usageApi.getUsageTrends(
         resolvedRange.startDate,
         resolvedRange.endDate,
@@ -125,18 +125,18 @@ export function useRequestLogs({
 }: RequestLogsQueryArgs) {
   const key: RequestLogsKey = {
     preset: range.preset,
+    rangeStartDate: range.startDate,
+    rangeEndDate: range.endDate,
     appType: filters.appType,
     providerName: filters.providerName,
     model: filters.model,
     statusCode: filters.statusCode,
-    startDate: filters.startDate,
-    endDate: filters.endDate,
   };
 
   return useQuery({
     queryKey: usageKeys.logs(key, page, pageSize),
     queryFn: () => {
-      const resolvedRange = resolveUsageTimeRangeValue(range);
+      const resolvedRange = getUsageTimeRangeQueryWindow(range);
       return usageApi.getRequestLogs(
         {
           ...filters,

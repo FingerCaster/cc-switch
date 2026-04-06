@@ -1073,6 +1073,8 @@
     "invalidTimeRangeOrder": "开始时间不能晚于结束时间",
     "timeRangeTooLarge": "时间范围过大，请缩小范围",
     "range": {
+      "allTime": "全部用量",
+      "allTimeHint": "统计全部历史数据",
       "today": "今天",
       "todayWithUnit": "今天（按小时）",
       "yesterday": "昨天",
