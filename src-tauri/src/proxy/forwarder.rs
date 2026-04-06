@@ -6,6 +6,7 @@ use super::hyper_client::ProxyResponse;
 use super::{
     body_filter::filter_private_params_with_whitelist,
     error::*,
+    error_mapper::{get_error_message, map_proxy_error_to_status},
     failover_switch::FailoverSwitchManager,
     log_codes::fwd as log_fwd,
     provider_router::ProviderRouter,
@@ -15,16 +16,44 @@ use super::{
         normalize_thinking_type, rectify_anthropic_request, should_rectify_thinking_signature,
     },
     types::{CopilotOptimizerConfig, OptimizerConfig, ProxyStatus, RectifierConfig},
+    usage::logger::UsageLogger,
     ProxyError,
 };
 use crate::commands::CopilotAuthState;
 use crate::proxy::providers::copilot_auth::CopilotAuthManager;
+use crate::proxy::extract_session_id;
 use crate::{app_config::AppType, provider::Provider};
 use http::Extensions;
 use serde_json::Value;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::RwLock;
+
+fn extract_model_from_endpoint(endpoint: &str) -> Option<String> {
+    endpoint
+        .split_once("/models/")
+        .map(|(_, model_path)| model_path)
+        .and_then(|model_path| {
+            let model = model_path
+                .split([':', '?'])
+                .next()
+                .unwrap_or(model_path)
+                .trim();
+            if model.is_empty() {
+                None
+            } else {
+                Some(model.to_string())
+            }
+        })
+}
+
+fn extract_request_model(body: &Value, endpoint: &str) -> String {
+    body.get("model")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .or_else(|| extract_model_from_endpoint(endpoint))
+        .unwrap_or_else(|| "unknown".to_string())
+}
 
 pub struct ForwardResult {
     pub response: ProxyResponse,
@@ -85,6 +114,41 @@ impl RequestForwarder {
             optimizer_config,
             copilot_optimizer_config,
             non_streaming_timeout: std::time::Duration::from_secs(non_streaming_timeout),
+        }
+    }
+
+    fn persist_attempt_failure(
+        &self,
+        provider: &Provider,
+        app_type: &str,
+        endpoint: &str,
+        body: &Value,
+        headers: &axum::http::HeaderMap,
+        error: &ProxyError,
+        latency_ms: u64,
+    ) {
+        let db = self.router.db();
+        let logger = UsageLogger::new(db.as_ref());
+
+        if let Err(log_error) = logger.log_error_with_context(
+            uuid::Uuid::new_v4().to_string(),
+            provider.id.clone(),
+            app_type.to_string(),
+            extract_request_model(body, endpoint),
+            map_proxy_error_to_status(error),
+            get_error_message(error),
+            latency_ms,
+            should_force_identity_encoding(endpoint, body, headers),
+            Some(extract_session_id(headers, body, app_type).session_id),
+            provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.provider_type.clone()),
+        ) {
+            log::warn!(
+                "[{app_type}] 记录失败尝试日志失败 (provider={}): {log_error}",
+                provider.id
+            );
         }
     }
 
@@ -173,6 +237,7 @@ impl RequestForwarder {
             }
 
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
+            let attempt_started_at = std::time::Instant::now();
             match self
                 .forward(
                     provider,
@@ -242,6 +307,16 @@ impl RequestForwarder {
                     });
                 }
                 Err(e) => {
+                    self.persist_attempt_failure(
+                        provider,
+                        app_type_str,
+                        endpoint,
+                        &provider_body,
+                        &headers,
+                        &e,
+                        attempt_started_at.elapsed().as_millis() as u64,
+                    );
+
                     // 检测是否需要触发整流器（仅 Claude/ClaudeAuth 供应商）
                     let provider_type = ProviderType::from_app_type_and_config(app_type, provider);
                     let is_anthropic_provider = matches!(
@@ -303,6 +378,7 @@ impl RequestForwarder {
                                 let _ = std::mem::replace(&mut rectifier_retried, true);
 
                                 // 使用同一供应商重试（不计入熔断器）
+                                let rectifier_retry_started_at = std::time::Instant::now();
                                 match self
                                     .forward(
                                         provider,
@@ -377,6 +453,15 @@ impl RequestForwarder {
                                         });
                                     }
                                     Err(retry_err) => {
+                                        self.persist_attempt_failure(
+                                            provider,
+                                            app_type_str,
+                                            endpoint,
+                                            &provider_body,
+                                            &headers,
+                                            &retry_err,
+                                            rectifier_retry_started_at.elapsed().as_millis() as u64,
+                                        );
                                         // 整流重试仍失败：区分错误类型决定是否记录熔断器
                                         log::warn!(
                                             "[{app_type_str}] [RECT-003] 整流重试仍失败: {retry_err}"
@@ -502,6 +587,7 @@ impl RequestForwarder {
                             let _ = std::mem::replace(&mut budget_rectifier_retried, true);
 
                             // 使用同一供应商重试（不计入熔断器）
+                            let budget_retry_started_at = std::time::Instant::now();
                             match self
                                 .forward(
                                     provider,
@@ -569,6 +655,15 @@ impl RequestForwarder {
                                     });
                                 }
                                 Err(retry_err) => {
+                                    self.persist_attempt_failure(
+                                        provider,
+                                        app_type_str,
+                                        endpoint,
+                                        &provider_body,
+                                        &headers,
+                                        &retry_err,
+                                        budget_retry_started_at.elapsed().as_millis() as u64,
+                                    );
                                     log::warn!(
                                         "[{app_type_str}] [RECT-012] budget 整流重试仍失败: {retry_err}"
                                     );
@@ -1613,9 +1708,70 @@ fn summarize_text_for_log(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AppError;
+    use crate::database::Database;
+    use crate::proxy::failover_switch::FailoverSwitchManager;
+    use crate::proxy::provider_router::ProviderRouter;
+    use crate::proxy::types::ProxyStatus;
     use axum::http::header::{HeaderValue, ACCEPT};
     use axum::http::HeaderMap;
+    use axum::{routing::post, Json, Router};
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::RwLock;
+
+    fn build_test_provider(id: &str, name: &str, base_url: &str) -> crate::provider::Provider {
+        crate::provider::Provider {
+            id: id.to_string(),
+            name: name.to_string(),
+            settings_config: json!({
+                "base_url": base_url,
+            }),
+            website_url: None,
+            category: Some("codex".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        }
+    }
+
+    async fn start_test_server_for_path(
+        path: &'static str,
+        status: u16,
+        body: serde_json::Value,
+    ) -> String {
+        let app = Router::new().route(
+            path,
+            post(move || {
+                let body = body.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::from_u16(status).expect("valid status"),
+                        Json(body),
+                    )
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+        format!("http://{}", addr)
+    }
+
+    async fn start_test_server(status: u16, body: serde_json::Value) -> String {
+        start_test_server_for_path("/v1/responses", status, body).await
+    }
 
     #[test]
     fn single_provider_retryable_log_uses_single_provider_code() {
@@ -1880,5 +2036,255 @@ mod tests {
             let will_replace = is_copilot && !is_full_url;
             assert_eq!(will_replace, should_replace, "{desc}");
         }
+    }
+
+    #[tokio::test]
+    async fn retryable_failover_attempts_should_be_persisted_to_request_logs() -> Result<(), AppError> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let db = Arc::new(Database::memory()?);
+        let router = Arc::new(ProviderRouter::new(db.clone()));
+        let failover_manager = Arc::new(FailoverSwitchManager::new(db.clone()));
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        let current_providers = Arc::new(RwLock::new(HashMap::new()));
+
+        let failure_base_url = start_test_server(
+            429,
+            json!({
+                "error": {
+                    "message": "rate limit exceeded"
+                }
+            }),
+        )
+        .await;
+        let success_base_url = start_test_server(
+            200,
+            json!({
+                "id": "resp_ok",
+                "model": "gpt-5",
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1
+                }
+            }),
+        )
+        .await;
+
+        let forwarder = RequestForwarder::new(
+            router,
+            5,
+            status,
+            current_providers,
+            failover_manager,
+            None,
+            "provider-a".to_string(),
+            0,
+            0,
+            RectifierConfig::default(),
+            OptimizerConfig::default(),
+            CopilotOptimizerConfig::default(),
+        );
+
+        let providers = vec![
+            build_test_provider("provider-a", "Provider A", &failure_base_url),
+            build_test_provider("provider-b", "Provider B", &success_base_url),
+        ];
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                "/responses",
+                json!({
+                    "model": "gpt-5",
+                    "input": "hello"
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                providers,
+            )
+            .await;
+
+        assert!(result.is_ok(), "second provider should succeed");
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM proxy_request_logs
+                 WHERE provider_id = 'provider-a'",
+                [],
+                |row: &rusqlite::Row<'_>| row.get(0),
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        assert_eq!(count, 1, "failed upstream attempt should be persisted");
+        let (status_code, provider_id): (i64, String) = conn
+            .query_row(
+                "SELECT status_code, provider_id
+                 FROM proxy_request_logs
+                 WHERE provider_id = 'provider-a'
+                 LIMIT 1",
+                [],
+                |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        assert_eq!(status_code, 429);
+        assert_eq!(provider_id, "provider-a");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retryable_failover_attempt_logs_should_keep_codex_session_id() -> Result<(), AppError> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let db = Arc::new(Database::memory()?);
+        let router = Arc::new(ProviderRouter::new(db.clone()));
+        let failover_manager = Arc::new(FailoverSwitchManager::new(db.clone()));
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        let current_providers = Arc::new(RwLock::new(HashMap::new()));
+
+        let failure_base_url = start_test_server(
+            429,
+            json!({
+                "error": {
+                    "message": "rate limit exceeded"
+                }
+            }),
+        )
+        .await;
+        let success_base_url = start_test_server(
+            200,
+            json!({
+                "id": "resp_ok",
+                "model": "gpt-5",
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1
+                }
+            }),
+        )
+        .await;
+
+        let forwarder = RequestForwarder::new(
+            router,
+            5,
+            status,
+            current_providers,
+            failover_manager,
+            None,
+            "provider-a".to_string(),
+            0,
+            0,
+            RectifierConfig::default(),
+            OptimizerConfig::default(),
+            CopilotOptimizerConfig::default(),
+        );
+
+        let providers = vec![
+            build_test_provider("provider-a", "Provider A", &failure_base_url),
+            build_test_provider("provider-b", "Provider B", &success_base_url),
+        ];
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                "/responses",
+                json!({
+                    "model": "gpt-5",
+                    "input": "hello",
+                    "previous_response_id": "resp_prev_123"
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                providers,
+            )
+            .await;
+
+        assert!(result.is_ok(), "second provider should succeed");
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let session_id: String = conn
+            .query_row(
+                "SELECT session_id
+                 FROM proxy_request_logs
+                 WHERE provider_id = 'provider-a'
+                 LIMIT 1",
+                [],
+                |row: &rusqlite::Row<'_>| row.get(0),
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        assert_eq!(session_id, "codex_resp_prev_123");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gemini_failover_attempt_logs_should_extract_model_from_endpoint() -> Result<(), AppError> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let db = Arc::new(Database::memory()?);
+        let router = Arc::new(ProviderRouter::new(db.clone()));
+        let failover_manager = Arc::new(FailoverSwitchManager::new(db.clone()));
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        let current_providers = Arc::new(RwLock::new(HashMap::new()));
+
+        let failure_base_url = start_test_server_for_path(
+            "/v1beta/models/gemini-2.5-pro:generateContent",
+            429,
+            json!({
+                "error": {
+                    "message": "quota exceeded"
+                }
+            }),
+        )
+        .await;
+
+        let forwarder = RequestForwarder::new(
+            router,
+            5,
+            status,
+            current_providers,
+            failover_manager,
+            None,
+            "provider-a".to_string(),
+            0,
+            0,
+            RectifierConfig::default(),
+            OptimizerConfig::default(),
+            CopilotOptimizerConfig::default(),
+        );
+
+        let providers = vec![build_test_provider(
+            "provider-a",
+            "Provider A",
+            &failure_base_url,
+        )];
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Gemini,
+                "/v1beta/models/gemini-2.5-pro:generateContent",
+                json!({
+                    "contents": []
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                providers,
+            )
+            .await;
+
+        assert!(result.is_err(), "single provider should fail");
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let model: String = conn
+            .query_row(
+                "SELECT model
+                 FROM proxy_request_logs
+                 WHERE provider_id = 'provider-a'
+                 LIMIT 1",
+                [],
+                |row: &rusqlite::Row<'_>| row.get(0),
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        assert_eq!(model, "gemini-2.5-pro");
+        Ok(())
     }
 }

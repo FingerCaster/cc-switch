@@ -27,39 +27,34 @@ import {
   getLocaleFromLanguage,
   parseFiniteNumber,
 } from "./format";
+import { UsageTimeRangePicker } from "./UsageTimeRangePicker";
+import {
+  getUsageTimeRangeValue,
+  type UsageTimeRangeValue,
+} from "./timeRange";
 
 interface RequestLogTableProps {
   refreshIntervalMs: number;
 }
 
-const ONE_DAY_SECONDS = 24 * 60 * 60;
-const MAX_FIXED_RANGE_SECONDS = 30 * ONE_DAY_SECONDS;
-
-type TimeMode = "rolling" | "fixed";
-
 export function RequestLogTable({ refreshIntervalMs }: RequestLogTableProps) {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
-
-  const getRollingRange = () => {
-    const now = Math.floor(Date.now() / 1000);
-    const oneDayAgo = now - ONE_DAY_SECONDS;
-    return { startDate: oneDayAgo, endDate: now };
-  };
-
-  const [appliedTimeMode, setAppliedTimeMode] = useState<TimeMode>("rolling");
-  const [draftTimeMode, setDraftTimeMode] = useState<TimeMode>("rolling");
-
+  const [selectedRange, setSelectedRange] = useState<UsageTimeRangeValue>(() => {
+    const todayRange = getUsageTimeRangeValue("today");
+    return todayRange;
+  });
+  const [appliedRange, setAppliedRange] = useState<UsageTimeRangeValue>(() =>
+    getUsageTimeRangeValue("today"),
+  );
   const [appliedFilters, setAppliedFilters] = useState<LogFilters>({});
   const [draftFilters, setDraftFilters] = useState<LogFilters>({});
   const [page, setPage] = useState(0);
   const pageSize = 20;
-  const [validationError, setValidationError] = useState<string | null>(null);
 
   const { data: result, isLoading } = useRequestLogs({
     filters: appliedFilters,
-    timeMode: appliedTimeMode,
-    rollingWindowSeconds: ONE_DAY_SECONDS,
+    range: appliedRange,
     page,
     pageSize,
     options: {
@@ -72,107 +67,43 @@ export function RequestLogTable({ refreshIntervalMs }: RequestLogTableProps) {
   const totalPages = Math.ceil(total / pageSize);
 
   const handleSearch = () => {
-    setValidationError(null);
-
-    if (draftTimeMode === "fixed") {
-      const start = draftFilters.startDate;
-      const end = draftFilters.endDate;
-
-      if (typeof start !== "number" || typeof end !== "number") {
-        setValidationError(
-          t("usage.invalidTimeRange", "请选择完整的开始/结束时间"),
-        );
-        return;
-      }
-
-      if (start > end) {
-        setValidationError(
-          t("usage.invalidTimeRangeOrder", "开始时间不能晚于结束时间"),
-        );
-        return;
-      }
-
-      if (end - start > MAX_FIXED_RANGE_SECONDS) {
-        setValidationError(
-          t("usage.timeRangeTooLarge", "时间范围过大，请缩小范围"),
-        );
-        return;
-      }
-    }
-
-    setAppliedTimeMode(draftTimeMode);
-    setAppliedFilters((prev) => {
-      const next = { ...prev, ...draftFilters };
-      if (draftTimeMode === "rolling") {
-        delete next.startDate;
-        delete next.endDate;
-      }
-      return next;
-    });
+    setAppliedRange(selectedRange);
+    setAppliedFilters(draftFilters);
     setPage(0);
   };
 
   const handleReset = () => {
-    setValidationError(null);
-    setAppliedTimeMode("rolling");
-    setDraftTimeMode("rolling");
+    const todayRange = getUsageTimeRangeValue("today");
+    setSelectedRange(todayRange);
+    setAppliedRange(todayRange);
     setDraftFilters({});
     setAppliedFilters({});
     setPage(0);
   };
 
   const handleRefresh = () => {
-    const key = {
-      timeMode: appliedTimeMode,
-      rollingWindowSeconds:
-        appliedTimeMode === "rolling" ? ONE_DAY_SECONDS : undefined,
-      appType: appliedFilters.appType,
-      providerName: appliedFilters.providerName,
-      model: appliedFilters.model,
-      statusCode: appliedFilters.statusCode,
-      startDate:
-        appliedTimeMode === "fixed" ? appliedFilters.startDate : undefined,
-      endDate: appliedTimeMode === "fixed" ? appliedFilters.endDate : undefined,
-    };
-
     queryClient.invalidateQueries({
-      queryKey: usageKeys.logs(key, page, pageSize),
+      queryKey: [...usageKeys.all, "logs"],
     });
-  };
-
-  // 将 Unix 时间戳转换为本地时间的 datetime-local 格式
-  const timestampToLocalDatetime = (timestamp: number): string => {
-    const date = new Date(timestamp * 1000);
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, "0");
-    const day = String(date.getDate()).padStart(2, "0");
-    const hours = String(date.getHours()).padStart(2, "0");
-    const minutes = String(date.getMinutes()).padStart(2, "0");
-    return `${year}-${month}-${day}T${hours}:${minutes}`;
-  };
-
-  // 将 datetime-local 格式转换为 Unix 时间戳
-  const localDatetimeToTimestamp = (datetime: string): number | undefined => {
-    if (!datetime) return undefined;
-    // 验证格式是否完整 (YYYY-MM-DDTHH:mm)
-    if (datetime.length < 16) return undefined;
-    const timestamp = new Date(datetime).getTime();
-    // 验证是否为有效日期
-    if (isNaN(timestamp)) return undefined;
-    return Math.floor(timestamp / 1000);
   };
 
   const language = i18n.resolvedLanguage || i18n.language || "en";
   const locale = getLocaleFromLanguage(language);
-
-  const rollingRangeForDisplay =
-    draftTimeMode === "rolling" ? getRollingRange() : null;
 
   return (
     <div className="space-y-4">
       {/* 筛选栏 */}
       <div className="flex flex-col gap-4 rounded-lg border bg-card/50 p-4 backdrop-blur-sm">
         <div className="flex flex-wrap items-center gap-3">
+          <UsageTimeRangePicker
+            value={selectedRange}
+            onApply={(range) => {
+              setSelectedRange(range);
+              setAppliedRange(range);
+              setPage(0);
+            }}
+            className="h-10 min-w-[140px]"
+          />
           <Select
             value={draftFilters.appType || "all"}
             onValueChange={(v) =>
@@ -249,52 +180,7 @@ export function RequestLogTable({ refreshIntervalMs }: RequestLogTableProps) {
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <span className="whitespace-nowrap">{t("usage.timeRange")}:</span>
-            <Input
-              type="datetime-local"
-              className="h-8 w-[200px] bg-background"
-              value={
-                (rollingRangeForDisplay?.startDate ?? draftFilters.startDate)
-                  ? timestampToLocalDatetime(
-                      (rollingRangeForDisplay?.startDate ??
-                        draftFilters.startDate) as number,
-                    )
-                  : ""
-              }
-              onChange={(e) => {
-                const timestamp = localDatetimeToTimestamp(e.target.value);
-                setDraftTimeMode("fixed");
-                setDraftFilters({
-                  ...draftFilters,
-                  startDate: timestamp,
-                });
-              }}
-            />
-            <span>-</span>
-            <Input
-              type="datetime-local"
-              className="h-8 w-[200px] bg-background"
-              value={
-                (rollingRangeForDisplay?.endDate ?? draftFilters.endDate)
-                  ? timestampToLocalDatetime(
-                      (rollingRangeForDisplay?.endDate ??
-                        draftFilters.endDate) as number,
-                    )
-                  : ""
-              }
-              onChange={(e) => {
-                const timestamp = localDatetimeToTimestamp(e.target.value);
-                setDraftTimeMode("fixed");
-                setDraftFilters({
-                  ...draftFilters,
-                  endDate: timestamp,
-                });
-              }}
-            />
-          </div>
-
+        <div className="flex flex-wrap items-center justify-end gap-3">
           <div className="flex items-center gap-2 ml-auto">
             <Button
               size="sm"
@@ -324,10 +210,6 @@ export function RequestLogTable({ refreshIntervalMs }: RequestLogTableProps) {
             </Button>
           </div>
         </div>
-
-        {validationError && (
-          <div className="text-sm text-red-600">{validationError}</div>
-        )}
       </div>
 
       {isLoading ? (

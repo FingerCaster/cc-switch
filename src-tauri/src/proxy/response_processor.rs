@@ -310,6 +310,45 @@ pub async fn process_response(
 
 type UsageCallbackWithTiming = Arc<dyn Fn(Vec<Value>, Option<u64>) + Send + Sync + 'static>;
 
+struct CollectorFinishGuard {
+    collector: Option<SseUsageCollector>,
+}
+
+impl CollectorFinishGuard {
+    fn new(collector: Option<SseUsageCollector>) -> Self {
+        Self { collector }
+    }
+
+    fn collector(&self) -> Option<&SseUsageCollector> {
+        self.collector.as_ref()
+    }
+
+    async fn finish_now(&mut self) {
+        if let Some(collector) = self.collector.take() {
+            collector.finish().await;
+        }
+    }
+}
+
+impl Drop for CollectorFinishGuard {
+    fn drop(&mut self) {
+        let Some(collector) = self.collector.take() else {
+            return;
+        };
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    collector.finish().await;
+                });
+            }
+            Err(err) => {
+                log::warn!("无法在 drop 时完成 SSE collector: {err}");
+            }
+        }
+    }
+}
+
 /// SSE 使用量收集器
 #[derive(Clone)]
 pub struct SseUsageCollector {
@@ -568,7 +607,7 @@ pub fn create_logged_passthrough_stream(
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
-        let mut collector = usage_collector;
+        let mut collector_guard = CollectorFinishGuard::new(usage_collector);
         let mut is_first_chunk = true;
 
         // 超时配置
@@ -633,7 +672,7 @@ pub fn create_logged_passthrough_stream(
                                 if let Some(data) = strip_sse_field(line, "data") {
                                     if data.trim() != "[DONE]" {
                                         if let Ok(json_value) = serde_json::from_str::<Value>(data) {
-                                            if let Some(c) = &collector {
+                                            if let Some(c) = collector_guard.collector() {
                                                 c.push(json_value.clone()).await;
                                             }
                                             log::debug!("[{tag}] <<< SSE 事件: {data}");
@@ -662,9 +701,7 @@ pub fn create_logged_passthrough_stream(
             }
         }
 
-        if let Some(c) = collector.take() {
-            c.finish().await;
-        }
+        collector_guard.finish_now().await;
     }
 }
 
@@ -691,6 +728,7 @@ mod tests {
     use rust_decimal::Decimal;
     use std::collections::HashMap;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -879,5 +917,45 @@ mod tests {
             Decimal::from_str("1.5").unwrap()
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_dropped_stream_still_finishes_usage_collector() {
+        let finish_calls = Arc::new(AtomicUsize::new(0));
+        let event_count = Arc::new(AtomicUsize::new(0));
+
+        let finish_calls_ref = finish_calls.clone();
+        let event_count_ref = event_count.clone();
+        let collector = SseUsageCollector::new(std::time::Instant::now(), move |events, _| {
+            finish_calls_ref.fetch_add(1, Ordering::SeqCst);
+            event_count_ref.store(events.len(), Ordering::SeqCst);
+        });
+
+        let upstream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+            "data: {\"type\":\"response.completed\"}\n\n",
+        ))]);
+
+        let mut stream = Box::pin(create_logged_passthrough_stream(
+            upstream,
+            "test-drop",
+            Some(collector),
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+        ));
+
+        let first_chunk = stream.next().await;
+        assert!(first_chunk.is_some(), "expected first SSE chunk");
+
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            finish_calls.load(Ordering::SeqCst),
+            1,
+            "collector should finish even if client drops stream early"
+        );
+        assert_eq!(event_count.load(Ordering::SeqCst), 1);
     }
 }

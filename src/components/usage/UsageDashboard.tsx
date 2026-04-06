@@ -6,7 +6,6 @@ import { UsageTrendChart } from "./UsageTrendChart";
 import { RequestLogTable } from "./RequestLogTable";
 import { ProviderStatsTable } from "./ProviderStatsTable";
 import { ModelStatsTable } from "./ModelStatsTable";
-import type { TimeRange } from "@/types/usage";
 import { motion } from "framer-motion";
 import {
   BarChart3,
@@ -25,11 +24,18 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion";
 import { PricingConfigPanel } from "@/components/usage/PricingConfigPanel";
+import { UsageTimeRangePicker } from "./UsageTimeRangePicker";
+import {
+  getUsageTimeRangeValue,
+  type UsageTimeRangeValue,
+} from "./timeRange";
 
 export function UsageDashboard() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [timeRange, setTimeRange] = useState<TimeRange>("1d");
+  const [timeRange, setTimeRange] = useState<UsageTimeRangeValue>(() =>
+    getUsageTimeRangeValue("today"),
+  );
   const [refreshIntervalMs, setRefreshIntervalMs] = useState(30000);
 
   const refreshIntervalOptionsMs = [0, 5000, 10000, 30000, 60000] as const;
@@ -44,8 +50,6 @@ export function UsageDashboard() {
     queryClient.invalidateQueries({ queryKey: usageKeys.all });
   };
 
-  const days = timeRange === "1d" ? 1 : timeRange === "7d" ? 7 : 30;
-
   return (
     <motion.div
       initial={{ opacity: 0, y: 10 }}
@@ -59,50 +63,25 @@ export function UsageDashboard() {
           <p className="text-sm text-muted-foreground">{t("usage.subtitle")}</p>
         </div>
 
-        <Tabs
-          value={timeRange}
-          onValueChange={(v) => setTimeRange(v as TimeRange)}
-          className="w-full sm:w-auto"
-        >
-          <div className="flex w-full sm:w-auto items-center gap-1">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-10 px-2 text-xs text-muted-foreground"
-              title={t("common.refresh", "刷新")}
-              onClick={changeRefreshInterval}
-            >
-              <RefreshCw className="mr-1 h-3.5 w-3.5" />
-              {refreshIntervalMs > 0 ? `${refreshIntervalMs / 1000}s` : "--"}
-            </Button>
-            <TabsList className="flex w-full sm:w-auto bg-card/60 border border-border/50 backdrop-blur-sm shadow-sm h-10 p-1">
-              <TabsTrigger
-                value="1d"
-                className="flex-1 sm:flex-none sm:px-6 data-[state=active]:bg-primary/10 data-[state=active]:text-primary hover:text-primary transition-colors"
-              >
-                {t("usage.today")}
-              </TabsTrigger>
-              <TabsTrigger
-                value="7d"
-                className="flex-1 sm:flex-none sm:px-6 data-[state=active]:bg-primary/10 data-[state=active]:text-primary hover:text-primary transition-colors"
-              >
-                {t("usage.last7days")}
-              </TabsTrigger>
-              <TabsTrigger
-                value="30d"
-                className="flex-1 sm:flex-none sm:px-6 data-[state=active]:bg-primary/10 data-[state=active]:text-primary hover:text-primary transition-colors"
-              >
-                {t("usage.last30days")}
-              </TabsTrigger>
-            </TabsList>
-          </div>
-        </Tabs>
+        <div className="flex w-full sm:w-auto items-center gap-2">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-10 px-2 text-xs text-muted-foreground"
+            title={t("common.refresh", "刷新")}
+            onClick={changeRefreshInterval}
+          >
+            <RefreshCw className="mr-1 h-3.5 w-3.5" />
+            {refreshIntervalMs > 0 ? `${refreshIntervalMs / 1000}s` : "--"}
+          </Button>
+          <UsageTimeRangePicker value={timeRange} onApply={setTimeRange} />
+        </div>
       </div>
 
-      <UsageSummaryCards days={days} refreshIntervalMs={refreshIntervalMs} />
+      <UsageSummaryCards range={timeRange} refreshIntervalMs={refreshIntervalMs} />
 
-      <UsageTrendChart days={days} refreshIntervalMs={refreshIntervalMs} />
+      <UsageTrendChart range={timeRange} refreshIntervalMs={refreshIntervalMs} />
 
       <div className="space-y-4">
         <Tabs defaultValue="logs" className="w-full">

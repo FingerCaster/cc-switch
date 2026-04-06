@@ -107,10 +107,13 @@ pub async fn handle_messages(
     {
         Ok(result) => result,
         Err(mut err) => {
+            let already_persisted = err.provider.is_some();
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
-            log_forward_error(&state, &ctx, is_stream, &err.error);
+            if !already_persisted {
+                log_forward_error(&state, &ctx, is_stream, &err.error);
+            }
             return Err(err.error);
         }
     };
@@ -357,10 +360,13 @@ pub async fn handle_chat_completions(
     {
         Ok(result) => result,
         Err(mut err) => {
+            let already_persisted = err.provider.is_some();
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
-            log_forward_error(&state, &ctx, is_stream, &err.error);
+            if !already_persisted {
+                log_forward_error(&state, &ctx, is_stream, &err.error);
+            }
             return Err(err.error);
         }
     };
@@ -411,10 +417,13 @@ pub async fn handle_responses(
     {
         Ok(result) => result,
         Err(mut err) => {
+            let already_persisted = err.provider.is_some();
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
-            log_forward_error(&state, &ctx, is_stream, &err.error);
+            if !already_persisted {
+                log_forward_error(&state, &ctx, is_stream, &err.error);
+            }
             return Err(err.error);
         }
     };
@@ -465,10 +474,13 @@ pub async fn handle_responses_compact(
     {
         Ok(result) => result,
         Err(mut err) => {
+            let already_persisted = err.provider.is_some();
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
-            log_forward_error(&state, &ctx, is_stream, &err.error);
+            if !already_persisted {
+                log_forward_error(&state, &ctx, is_stream, &err.error);
+            }
             return Err(err.error);
         }
     };
@@ -530,10 +542,13 @@ pub async fn handle_gemini(
     {
         Ok(result) => result,
         Err(mut err) => {
+            let already_persisted = err.provider.is_some();
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
-            log_forward_error(&state, &ctx, is_stream, &err.error);
+            if !already_persisted {
+                log_forward_error(&state, &ctx, is_stream, &err.error);
+            }
             return Err(err.error);
         }
     };

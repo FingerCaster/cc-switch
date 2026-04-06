@@ -17,18 +17,19 @@ import {
   getLocaleFromLanguage,
   parseFiniteNumber,
 } from "./format";
+import type { UsageTimeRangeValue } from "./timeRange";
 
 interface UsageTrendChartProps {
-  days: number;
+  range: UsageTimeRangeValue;
   refreshIntervalMs: number;
 }
 
 export function UsageTrendChart({
-  days,
+  range,
   refreshIntervalMs,
 }: UsageTrendChartProps) {
   const { t, i18n } = useTranslation();
-  const { data: trends, isLoading } = useUsageTrends(days, {
+  const { data: trends, isLoading } = useUsageTrends(range, {
     refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
   });
 
@@ -40,7 +41,7 @@ export function UsageTrendChart({
     );
   }
 
-  const isToday = days === 1;
+  const isToday = range.preset === "today";
   const language = i18n.resolvedLanguage || i18n.language || "en";
   const dateLocale = getLocaleFromLanguage(language);
   const chartData =
@@ -107,11 +108,9 @@ export function UsageTrendChart({
           {t("usage.trends", "使用趋势")}
         </h3>
         <p className="text-sm text-muted-foreground">
-          {isToday
-            ? t("usage.rangeToday", "今天 (按小时)")
-            : days === 7
-              ? t("usage.rangeLast7Days", "过去 7 天")
-              : t("usage.rangeLast30Days", "过去 30 天")}
+          {range.preset === "today"
+            ? t("usage.range.todayWithUnit", "今天（按小时）")
+            : t("usage.range.selected", "所选时间范围")}
         </p>
       </div>
 

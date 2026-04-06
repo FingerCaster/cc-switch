@@ -5,19 +5,20 @@ import { useUsageSummary } from "@/lib/query/usage";
 import { Activity, DollarSign, Layers, Database, Loader2 } from "lucide-react";
 import { motion } from "framer-motion";
 import { fmtUsd, parseFiniteNumber } from "./format";
+import type { UsageTimeRangeValue } from "./timeRange";
 
 interface UsageSummaryCardsProps {
-  days: number;
+  range: UsageTimeRangeValue;
   refreshIntervalMs: number;
 }
 
 export function UsageSummaryCards({
-  days,
+  range,
   refreshIntervalMs,
 }: UsageSummaryCardsProps) {
   const { t } = useTranslation();
 
-  const { data: summary, isLoading } = useUsageSummary(days, {
+  const { data: summary, isLoading } = useUsageSummary(range, {
     refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
   });
 

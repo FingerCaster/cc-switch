@@ -14,6 +14,24 @@ use crate::proxy::{
 use axum::http::HeaderMap;
 use std::time::Instant;
 
+fn extract_model_from_endpoint(endpoint: &str) -> Option<String> {
+    endpoint
+        .split_once("/models/")
+        .map(|(_, model_path)| model_path)
+        .and_then(|model_path| {
+            let model = model_path
+                .split([':', '?'])
+                .next()
+                .unwrap_or(model_path)
+                .trim();
+            if model.is_empty() {
+                None
+            } else {
+                Some(model.to_string())
+            }
+        })
+}
+
 /// 流式超时配置
 #[derive(Debug, Clone, Copy)]
 pub struct StreamingTimeoutConfig {
@@ -177,13 +195,8 @@ impl RequestContext {
             .map(|pq| pq.as_str())
             .unwrap_or(uri.path());
 
-        self.request_model = endpoint
-            .split('/')
-            .find(|s| s.starts_with("models/"))
-            .and_then(|s| s.strip_prefix("models/"))
-            .map(|s| s.split(':').next().unwrap_or(s))
-            .unwrap_or("unknown")
-            .to_string();
+        self.request_model =
+            extract_model_from_endpoint(endpoint).unwrap_or_else(|| "unknown".to_string());
 
         self
     }
@@ -262,5 +275,25 @@ impl RequestContext {
                 idle_timeout: 0,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_model_from_endpoint;
+
+    #[test]
+    fn extracts_gemini_model_from_generate_content_endpoint() {
+        let model = extract_model_from_endpoint("/v1beta/models/gemini-2.5-pro:generateContent");
+
+        assert_eq!(model.as_deref(), Some("gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn extracts_gemini_model_from_stream_endpoint_with_query() {
+        let model =
+            extract_model_from_endpoint("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse");
+
+        assert_eq!(model.as_deref(), Some("gemini-2.5-pro"));
     }
 }

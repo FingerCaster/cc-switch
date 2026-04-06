@@ -1,6 +1,10 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { usageApi } from "@/lib/api/usage";
 import type { LogFilters } from "@/types/usage";
+import {
+  resolveUsageTimeRangeValue,
+  type UsageTimeRangeValue,
+} from "@/components/usage/timeRange";
 
 const DEFAULT_REFETCH_INTERVAL_MS = 30000;
 
@@ -9,20 +13,16 @@ type UsageQueryOptions = {
   refetchIntervalInBackground?: boolean;
 };
 
-type RequestLogsTimeMode = "rolling" | "fixed";
-
 type RequestLogsQueryArgs = {
   filters: LogFilters;
-  timeMode: RequestLogsTimeMode;
+  range: UsageTimeRangeValue;
   page?: number;
   pageSize?: number;
-  rollingWindowSeconds?: number;
   options?: UsageQueryOptions;
 };
 
 type RequestLogsKey = {
-  timeMode: RequestLogsTimeMode;
-  rollingWindowSeconds?: number;
+  preset: UsageTimeRangeValue["preset"];
   appType?: string;
   providerName?: string;
   model?: string;
@@ -34,16 +34,17 @@ type RequestLogsKey = {
 // Query keys
 export const usageKeys = {
   all: ["usage"] as const,
-  summary: (days: number) => [...usageKeys.all, "summary", days] as const,
-  trends: (days: number) => [...usageKeys.all, "trends", days] as const,
+  summary: (startDate: number, endDate: number) =>
+    [...usageKeys.all, "summary", startDate, endDate] as const,
+  trends: (startDate: number, endDate: number) =>
+    [...usageKeys.all, "trends", startDate, endDate] as const,
   providerStats: () => [...usageKeys.all, "provider-stats"] as const,
   modelStats: () => [...usageKeys.all, "model-stats"] as const,
   logs: (key: RequestLogsKey, page: number, pageSize: number) =>
     [
       ...usageKeys.all,
       "logs",
-      key.timeMode,
-      key.rollingWindowSeconds ?? 0,
+      key.preset,
       key.appType ?? "",
       key.providerName ?? "",
       key.model ?? "",
@@ -60,31 +61,37 @@ export const usageKeys = {
     [...usageKeys.all, "limits", providerId, appType] as const,
 };
 
-const getWindow = (days: number) => {
-  const endDate = Math.floor(Date.now() / 1000);
-  const startDate = endDate - days * 24 * 60 * 60;
-  return { startDate, endDate };
-};
-
 // Hooks
-export function useUsageSummary(days: number, options?: UsageQueryOptions) {
+export function useUsageSummary(
+  range: UsageTimeRangeValue,
+  options?: UsageQueryOptions,
+) {
   return useQuery({
-    queryKey: usageKeys.summary(days),
+    queryKey: usageKeys.summary(range.startDate, range.endDate),
     queryFn: () => {
-      const { startDate, endDate } = getWindow(days);
-      return usageApi.getUsageSummary(startDate, endDate);
+      const resolvedRange = resolveUsageTimeRangeValue(range);
+      return usageApi.getUsageSummary(
+        resolvedRange.startDate,
+        resolvedRange.endDate,
+      );
     },
     refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS, // 每30秒自动刷新
     refetchIntervalInBackground: options?.refetchIntervalInBackground ?? false, // 后台不刷新
   });
 }
 
-export function useUsageTrends(days: number, options?: UsageQueryOptions) {
+export function useUsageTrends(
+  range: UsageTimeRangeValue,
+  options?: UsageQueryOptions,
+) {
   return useQuery({
-    queryKey: usageKeys.trends(days),
+    queryKey: usageKeys.trends(range.startDate, range.endDate),
     queryFn: () => {
-      const { startDate, endDate } = getWindow(days);
-      return usageApi.getUsageTrends(startDate, endDate);
+      const resolvedRange = resolveUsageTimeRangeValue(range);
+      return usageApi.getUsageTrends(
+        resolvedRange.startDate,
+        resolvedRange.endDate,
+      );
     },
     refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS, // 每30秒自动刷新
     refetchIntervalInBackground: options?.refetchIntervalInBackground ?? false,
@@ -109,40 +116,36 @@ export function useModelStats(options?: UsageQueryOptions) {
   });
 }
 
-const getRollingRange = (windowSeconds: number) => {
-  const endDate = Math.floor(Date.now() / 1000);
-  const startDate = endDate - windowSeconds;
-  return { startDate, endDate };
-};
-
 export function useRequestLogs({
   filters,
-  timeMode,
+  range,
   page = 0,
   pageSize = 20,
-  rollingWindowSeconds = 24 * 60 * 60,
   options,
 }: RequestLogsQueryArgs) {
   const key: RequestLogsKey = {
-    timeMode,
-    rollingWindowSeconds:
-      timeMode === "rolling" ? rollingWindowSeconds : undefined,
+    preset: range.preset,
     appType: filters.appType,
     providerName: filters.providerName,
     model: filters.model,
     statusCode: filters.statusCode,
-    startDate: timeMode === "fixed" ? filters.startDate : undefined,
-    endDate: timeMode === "fixed" ? filters.endDate : undefined,
+    startDate: filters.startDate,
+    endDate: filters.endDate,
   };
 
   return useQuery({
     queryKey: usageKeys.logs(key, page, pageSize),
     queryFn: () => {
-      const effectiveFilters =
-        timeMode === "rolling"
-          ? { ...filters, ...getRollingRange(rollingWindowSeconds) }
-          : filters;
-      return usageApi.getRequestLogs(effectiveFilters, page, pageSize);
+      const resolvedRange = resolveUsageTimeRangeValue(range);
+      return usageApi.getRequestLogs(
+        {
+          ...filters,
+          startDate: resolvedRange.startDate,
+          endDate: resolvedRange.endDate,
+        },
+        page,
+        pageSize,
+      );
     },
     refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS, // 每30秒自动刷新
     refetchIntervalInBackground: options?.refetchIntervalInBackground ?? false,
