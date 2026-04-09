@@ -62,6 +62,9 @@ pub enum ProxyError {
     #[error("超时: {0}")]
     Timeout(String),
 
+    #[error("语义失败: {0}")]
+    SemanticFailure(String),
+
     /// 流式响应空闲超时
     #[allow(dead_code)]
     #[error("流式响应空闲超时: {0}秒无数据")]
@@ -149,6 +152,7 @@ impl IntoResponse for ProxyError {
                     }
                     ProxyError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
                     ProxyError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
+                    ProxyError::SemanticFailure(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
                     ProxyError::StreamIdleTimeout(_) => {
                         (StatusCode::GATEWAY_TIMEOUT, self.to_string())
                     }

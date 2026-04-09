@@ -5,7 +5,7 @@
 use super::{
     handler_config::UsageParserConfig,
     handler_context::{RequestContext, StreamingTimeoutConfig},
-    hyper_client::ProxyResponse,
+    hyper_client::{ProxyResponse, ResponseTiming},
     server::ProxyState,
     sse::strip_sse_field,
     usage::parser::TokenUsage,
@@ -148,6 +148,8 @@ pub async fn handle_streaming(
     parser_config: &UsageParserConfig,
 ) -> Response {
     let status = response.status();
+    let semantic_note = response.semantic_note().map(str::to_string);
+    let response_timing = response.timing();
     log::debug!(
         "[{}] 已接收上游流式响应: status={}, headers={}",
         ctx.tag,
@@ -174,7 +176,14 @@ pub async fn handle_streaming(
     let stream = response.bytes_stream();
 
     // 创建使用量收集器
-    let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config);
+    let usage_collector = create_usage_collector(
+        ctx,
+        state,
+        status.as_u16(),
+        parser_config,
+        semantic_note,
+        response_timing,
+    );
 
     // 获取流式超时配置
     let timeout_config = ctx.streaming_timeout_config();
@@ -200,6 +209,8 @@ pub async fn handle_non_streaming(
     state: &ProxyState,
     parser_config: &UsageParserConfig,
 ) -> Result<Response, ProxyError> {
+    let semantic_note = response.semantic_note().map(str::to_string);
+    let response_timing = response.timing().unwrap_or_default();
     // 整包超时：仅在故障转移开启且配置值非零时生效
     let body_timeout =
         if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
@@ -235,8 +246,14 @@ pub async fn handle_non_streaming(
                 usage,
                 &model,
                 &ctx.request_model,
+                resolve_duration_ms(
+                    response_timing,
+                    response_timing.upstream_started_at.unwrap_or(ctx.start_time),
+                    ctx.latency_ms(),
+                ),
                 status.as_u16(),
                 false,
+                semantic_note.clone(),
             );
         } else {
             let model = json_value
@@ -250,8 +267,14 @@ pub async fn handle_non_streaming(
                 TokenUsage::default(),
                 &model,
                 &ctx.request_model,
+                resolve_duration_ms(
+                    response_timing,
+                    response_timing.upstream_started_at.unwrap_or(ctx.start_time),
+                    ctx.latency_ms(),
+                ),
                 status.as_u16(),
                 false,
+                semantic_note.clone(),
             );
             log::debug!(
                 "[{}] 未能解析 usage 信息，跳过记录",
@@ -270,8 +293,14 @@ pub async fn handle_non_streaming(
             TokenUsage::default(),
             &ctx.request_model,
             &ctx.request_model,
+            resolve_duration_ms(
+                response_timing,
+                response_timing.upstream_started_at.unwrap_or(ctx.start_time),
+                ctx.latency_ms(),
+            ),
             status.as_u16(),
             false,
+            semantic_note,
         );
     }
 
@@ -424,6 +453,8 @@ fn create_usage_collector(
     state: &ProxyState,
     status_code: u16,
     parser_config: &UsageParserConfig,
+    semantic_note: Option<String>,
+    response_timing: Option<ResponseTiming>,
 ) -> SseUsageCollector {
     let logging_enabled = state
         .config
@@ -435,23 +466,31 @@ fn create_usage_collector(
     let request_model = ctx.request_model.clone();
     let app_type_str = parser_config.app_type_str;
     let tag = ctx.tag;
-    let start_time = ctx.start_time;
+    let request_start_time = ctx.start_time;
+    let response_timing = response_timing.unwrap_or_default();
+    let timing_start_time = response_timing
+        .upstream_started_at
+        .unwrap_or(request_start_time);
     let stream_parser = parser_config.stream_parser;
     let model_extractor = parser_config.model_extractor;
     let session_id = ctx.session_id.clone();
+    let semantic_note = semantic_note.clone();
 
-    SseUsageCollector::new(start_time, move |events, first_token_ms| {
+    SseUsageCollector::new(timing_start_time, move |events, first_token_ms| {
         if !logging_enabled {
             return;
         }
         if let Some(usage) = stream_parser(&events) {
             let model = model_extractor(&events, &request_model);
-            let latency_ms = start_time.elapsed().as_millis() as u64;
+            let latency_ms = request_start_time.elapsed().as_millis() as u64;
+            let duration_ms = resolve_duration_ms(response_timing, timing_start_time, latency_ms);
+            let first_token_ms = resolve_first_token_ms(response_timing, first_token_ms);
 
             let state = state.clone();
             let provider_id = provider_id.clone();
             let session_id = session_id.clone();
             let request_model = request_model.clone();
+            let semantic_note = semantic_note.clone();
 
             tokio::spawn(async move {
                 log_usage_internal(
@@ -463,19 +502,24 @@ fn create_usage_collector(
                     usage,
                     latency_ms,
                     first_token_ms,
+                    duration_ms,
                     true, // is_streaming
                     status_code,
                     Some(session_id),
+                    semantic_note,
                 )
                 .await;
             });
         } else {
             let model = model_extractor(&events, &request_model);
-            let latency_ms = start_time.elapsed().as_millis() as u64;
+            let latency_ms = request_start_time.elapsed().as_millis() as u64;
+            let duration_ms = resolve_duration_ms(response_timing, timing_start_time, latency_ms);
+            let first_token_ms = resolve_first_token_ms(response_timing, first_token_ms);
             let state = state.clone();
             let provider_id = provider_id.clone();
             let session_id = session_id.clone();
             let request_model = request_model.clone();
+            let semantic_note = semantic_note.clone();
 
             tokio::spawn(async move {
                 log_usage_internal(
@@ -487,9 +531,11 @@ fn create_usage_collector(
                     TokenUsage::default(),
                     latency_ms,
                     first_token_ms,
+                    duration_ms,
                     true, // is_streaming
                     status_code,
                     Some(session_id),
+                    semantic_note,
                 )
                 .await;
             });
@@ -505,8 +551,10 @@ fn spawn_log_usage(
     usage: TokenUsage,
     model: &str,
     request_model: &str,
+    duration_ms: u64,
     status_code: u16,
     is_streaming: bool,
+    semantic_note: Option<String>,
 ) {
     // Check enable_logging before spawning the log task
     if let Ok(config) = state.config.try_read() {
@@ -522,6 +570,7 @@ fn spawn_log_usage(
     let request_model = request_model.to_string();
     let latency_ms = ctx.latency_ms();
     let session_id = ctx.session_id.clone();
+    let semantic_note = semantic_note.clone();
 
     tokio::spawn(async move {
         log_usage_internal(
@@ -533,9 +582,11 @@ fn spawn_log_usage(
             usage,
             latency_ms,
             None,
+            duration_ms,
             is_streaming,
             status_code,
             Some(session_id),
+            semantic_note,
         )
         .await;
     });
@@ -552,9 +603,11 @@ async fn log_usage_internal(
     usage: TokenUsage,
     latency_ms: u64,
     first_token_ms: Option<u64>,
+    duration_ms: u64,
     is_streaming: bool,
     status_code: u16,
     session_id: Option<String>,
+    error_message: Option<String>,
 ) {
     use super::usage::logger::UsageLogger;
 
@@ -570,12 +623,13 @@ async fn log_usage_internal(
     let request_id = uuid::Uuid::new_v4().to_string();
 
     log::debug!(
-        "[{app_type}] 记录请求日志: id={request_id}, provider={provider_id}, model={model}, streaming={is_streaming}, status={status_code}, latency_ms={latency_ms}, first_token_ms={first_token_ms:?}, session={}, input={}, output={}, cache_read={}, cache_creation={}",
+        "[{app_type}] 记录请求日志: id={request_id}, provider={provider_id}, model={model}, streaming={is_streaming}, status={status_code}, latency_ms={latency_ms}, first_token_ms={first_token_ms:?}, duration_ms={duration_ms}, session={}, input={}, output={}, cache_read={}, cache_creation={}, error={}",
         session_id.as_deref().unwrap_or("none"),
         usage.input_tokens,
         usage.output_tokens,
         usage.cache_read_tokens,
-        usage.cache_creation_tokens
+        usage.cache_creation_tokens,
+        error_message.as_deref().unwrap_or("none")
     );
 
     if let Err(e) = logger.log_with_calculation(
@@ -589,12 +643,40 @@ async fn log_usage_internal(
         multiplier,
         latency_ms,
         first_token_ms,
+        duration_ms,
         status_code,
         session_id,
+        error_message,
         None, // provider_type
         is_streaming,
     ) {
         log::warn!("[USG-001] 记录使用量失败: {e}");
+    }
+}
+
+fn resolve_first_token_ms(
+    response_timing: ResponseTiming,
+    collected_first_token_ms: Option<u64>,
+) -> Option<u64> {
+    if response_timing.upstream_first_token_known {
+        response_timing.upstream_first_token_ms
+    } else {
+        collected_first_token_ms
+    }
+}
+
+fn resolve_duration_ms(
+    response_timing: ResponseTiming,
+    timing_start_time: std::time::Instant,
+    fallback_latency_ms: u64,
+) -> u64 {
+    let duration_ms = response_timing
+        .upstream_duration_ms
+        .unwrap_or_else(|| timing_start_time.elapsed().as_millis() as u64);
+    if duration_ms == 0 {
+        fallback_latency_ms.max(1)
+    } else {
+        duration_ms
     }
 }
 
@@ -719,12 +801,19 @@ fn format_headers(headers: &HeaderMap) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_config::AppType;
     use crate::database::Database;
     use crate::error::AppError;
     use crate::provider::ProviderMeta;
+    use crate::proxy::handler_config::CODEX_PARSER_CONFIG;
+    use crate::proxy::handler_context::RequestContext;
     use crate::proxy::failover_switch::FailoverSwitchManager;
+    use crate::proxy::hyper_client::ResponseTiming;
     use crate::proxy::provider_router::ProviderRouter;
     use crate::proxy::types::{ProxyConfig, ProxyStatus};
+    use axum::http::header::CONTENT_TYPE;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use serde_json::json;
     use rust_decimal::Decimal;
     use std::collections::HashMap;
     use std::str::FromStr;
@@ -833,8 +922,10 @@ mod tests {
             usage,
             10,
             None,
+            10,
             false,
             200,
+            None,
             None,
         )
         .await;
@@ -892,8 +983,10 @@ mod tests {
             usage,
             10,
             None,
+            10,
             false,
             200,
+            None,
             None,
         )
         .await;
@@ -957,5 +1050,78 @@ mod tests {
             "collector should finish even if client drops stream early"
         );
         assert_eq!(event_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_process_response_prefers_upstream_timing_metadata_for_stream_logs()
+    -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        seed_pricing(&db)?;
+        insert_provider(&db, "provider-timing", "codex", ProviderMeta::default())?;
+        db.set_current_provider("codex", "provider-timing")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let state = build_state(db.clone());
+        let ctx = RequestContext::new(
+            &state,
+            &json!({
+                "model": "resp-model",
+                "input": "hello",
+                "stream": true
+            }),
+            &HeaderMap::new(),
+            AppType::Codex,
+            "Codex",
+            "codex",
+        )
+        .await
+        .map_err(|e| AppError::Message(e.to_string()))?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+
+        let upstream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+            concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\",\"model\":\"resp-model\"}}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"model\":\"resp-model\",\"usage\":{\"input_tokens\":12,\"output_tokens\":6}}}\n\n"
+            ),
+        ))]);
+        let response = ProxyResponse::from_stream(StatusCode::OK, headers, Box::pin(upstream))
+            .with_timing(ResponseTiming {
+                upstream_started_at: None,
+                upstream_first_token_ms: Some(25),
+                upstream_first_token_known: true,
+                upstream_duration_ms: Some(60),
+            });
+
+        let response = process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG)
+            .await
+            .map_err(|e| AppError::Message(e.to_string()))?;
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(|e| AppError::Message(e.to_string()))?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let (latency_ms, first_token_ms, duration_ms): (i64, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT latency_ms, first_token_ms, duration_ms
+                 FROM proxy_request_logs
+                 WHERE provider_id = 'provider-timing'
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        assert!(latency_ms >= 0);
+        assert_eq!(first_token_ms, Some(25));
+        assert_eq!(duration_ms, Some(60));
+        Ok(())
     }
 }

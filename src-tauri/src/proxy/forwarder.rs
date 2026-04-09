@@ -2,7 +2,7 @@
 //!
 //! 负责将请求转发到上游Provider，支持故障转移
 
-use super::hyper_client::ProxyResponse;
+use super::hyper_client::{ByteStream, ProxyResponse, ResponseTiming};
 use super::{
     body_filter::filter_private_params_with_whitelist,
     error::*,
@@ -11,14 +11,18 @@ use super::{
     log_codes::fwd as log_fwd,
     provider_router::ProviderRouter,
     providers::{get_adapter, AuthInfo, AuthStrategy, ProviderAdapter, ProviderType},
+    response_processor::read_decoded_body,
+    sse::strip_sse_field,
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
         normalize_thinking_type, rectify_anthropic_request, should_rectify_thinking_signature,
     },
     types::{CopilotOptimizerConfig, OptimizerConfig, ProxyStatus, RectifierConfig},
-    usage::logger::UsageLogger,
+    usage::{logger::UsageLogger, parser::TokenUsage},
     ProxyError,
 };
+use bytes::Bytes;
+use futures::StreamExt;
 use crate::commands::CopilotAuthState;
 use crate::proxy::providers::copilot_auth::CopilotAuthManager;
 use crate::proxy::extract_session_id;
@@ -28,6 +32,8 @@ use serde_json::Value;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::RwLock;
+
+const CODEX_SEMANTIC_FAILURE_THRESHOLD: u32 = 3;
 
 fn extract_model_from_endpoint(endpoint: &str) -> Option<String> {
     endpoint
@@ -85,6 +91,15 @@ pub struct RequestForwarder {
     copilot_optimizer_config: CopilotOptimizerConfig,
     /// 非流式请求超时（秒）
     non_streaming_timeout: std::time::Duration,
+    /// 流式首字节超时（秒）
+    streaming_first_byte_timeout: std::time::Duration,
+    /// 流式空闲超时（秒）
+    streaming_idle_timeout: std::time::Duration,
+}
+
+enum SemanticValidationOutcome {
+    Success(ProxyResponse),
+    ToleratedAnomaly { response: ProxyResponse, note: String },
 }
 
 impl RequestForwarder {
@@ -114,6 +129,10 @@ impl RequestForwarder {
             optimizer_config,
             copilot_optimizer_config,
             non_streaming_timeout: std::time::Duration::from_secs(non_streaming_timeout),
+            streaming_first_byte_timeout: std::time::Duration::from_secs(
+                _streaming_first_byte_timeout,
+            ),
+            streaming_idle_timeout: std::time::Duration::from_secs(_streaming_idle_timeout),
         }
     }
 
@@ -238,7 +257,7 @@ impl RequestForwarder {
 
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
             let attempt_started_at = std::time::Instant::now();
-            match self
+            let attempt_result = match self
                 .forward(
                     provider,
                     endpoint,
@@ -249,7 +268,21 @@ impl RequestForwarder {
                 )
                 .await
             {
-                Ok((response, claude_api_format)) => {
+                Ok((response, claude_api_format)) => self
+                    .validate_semantic_success(
+                        app_type,
+                        app_type_str,
+                        &provider.id,
+                        response,
+                        attempt_started_at,
+                    )
+                    .await
+                    .map(|validated_response| (validated_response, claude_api_format)),
+                Err(e) => Err(e),
+            };
+
+            match attempt_result {
+                Ok((SemanticValidationOutcome::Success(response), claude_api_format)) => {
                     // 成功：记录成功并更新熔断器
                     let _ = self
                         .router
@@ -299,6 +332,37 @@ impl RequestForwarder {
                                 * 100.0;
                         }
                     }
+
+                    return Ok(ForwardResult {
+                        response,
+                        provider: provider.clone(),
+                        claude_api_format,
+                    });
+                }
+                Ok((
+                    SemanticValidationOutcome::ToleratedAnomaly { response, note },
+                    claude_api_format,
+                )) => {
+                    self.router
+                        .release_permit_neutral(
+                            &provider.id,
+                            app_type_str,
+                            used_half_open_permit,
+                        )
+                        .await;
+
+                    {
+                        let mut status = self.status.write().await;
+                        status.failed_requests += 1;
+                        status.last_error = Some(note.clone());
+                        if status.total_requests > 0 {
+                            status.success_rate = (status.success_requests as f32
+                                / status.total_requests as f32)
+                                * 100.0;
+                        }
+                    }
+
+                    log::warn!("[{app_type_str}] [SEM-001] {note}");
 
                     return Ok(ForwardResult {
                         response,
@@ -1388,6 +1452,229 @@ impl RequestForwarder {
         }
     }
 
+    async fn validate_semantic_success(
+        &self,
+        app_type: &AppType,
+        app_type_str: &str,
+        provider_id: &str,
+        response: ProxyResponse,
+        attempt_started_at: std::time::Instant,
+    ) -> Result<SemanticValidationOutcome, ProxyError> {
+        if !matches!(app_type, AppType::Codex) {
+            self.router
+                .reset_semantic_failure_streak(provider_id, app_type_str)
+                .await;
+            return Ok(SemanticValidationOutcome::Success(
+                response.with_timing(ResponseTiming {
+                    upstream_started_at: Some(attempt_started_at),
+                    ..ResponseTiming::default()
+                }),
+            ));
+        }
+
+        if response.is_sse() {
+            self.validate_codex_streaming_response(
+                app_type_str,
+                provider_id,
+                response,
+                attempt_started_at,
+            )
+                .await
+        } else {
+            self.validate_codex_non_streaming_response(
+                app_type_str,
+                provider_id,
+                response,
+                attempt_started_at,
+            )
+                .await
+        }
+    }
+
+    async fn validate_codex_non_streaming_response(
+        &self,
+        app_type_str: &str,
+        provider_id: &str,
+        response: ProxyResponse,
+        attempt_started_at: std::time::Instant,
+    ) -> Result<SemanticValidationOutcome, ProxyError> {
+        let (headers, status, body_bytes) =
+            read_decoded_body(response, "CodexSemantic", self.non_streaming_timeout).await?;
+        let timing = ResponseTiming {
+            upstream_started_at: Some(attempt_started_at),
+            upstream_duration_ms: Some(attempt_started_at.elapsed().as_millis() as u64),
+            ..ResponseTiming::default()
+        };
+
+        let json_body = serde_json::from_slice::<Value>(&body_bytes).map_err(|_| {
+            ProxyError::SemanticFailure("上游返回 200，但响应不是有效 JSON".to_string())
+        })?;
+
+        if is_meaningful_codex_non_streaming_body(&json_body) {
+            self.router
+                .reset_semantic_failure_streak(provider_id, app_type_str)
+                .await;
+            Ok(SemanticValidationOutcome::Success(
+                ProxyResponse::from_buffered(status, headers, body_bytes).with_timing(timing),
+            ))
+        } else {
+            let streak = self
+                .router
+                .record_semantic_failure(provider_id, app_type_str)
+                .await;
+            let base_message = "上游返回 200，但响应缺少有效输出，usage 全 0 或缺失";
+
+            if streak < CODEX_SEMANTIC_FAILURE_THRESHOLD {
+                let note = format!("语义异常（{streak}/{CODEX_SEMANTIC_FAILURE_THRESHOLD}）：{base_message}");
+                Ok(SemanticValidationOutcome::ToleratedAnomaly {
+                    response: ProxyResponse::from_buffered(status, headers, body_bytes)
+                        .with_timing(timing)
+                        .with_semantic_note(note.clone()),
+                    note,
+                })
+            } else {
+                Err(ProxyError::SemanticFailure(format!(
+                    "语义异常连续 {streak}/{CODEX_SEMANTIC_FAILURE_THRESHOLD} 次，判定 Provider 失败并切换：{base_message}"
+                )))
+            }
+        }
+    }
+
+    async fn validate_codex_streaming_response(
+        &self,
+        app_type_str: &str,
+        provider_id: &str,
+        response: ProxyResponse,
+        attempt_started_at: std::time::Instant,
+    ) -> Result<SemanticValidationOutcome, ProxyError> {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut stream = response.bytes_stream();
+        let mut buffered_chunks = Vec::new();
+        let mut sse_buffer = String::new();
+        let mut is_first_chunk = true;
+        let mut first_upstream_event_ms = None;
+        loop {
+            let timeout_duration = if is_first_chunk {
+                self.streaming_first_byte_timeout
+            } else {
+                self.streaming_idle_timeout
+            };
+
+            let next_chunk = if timeout_duration.is_zero() {
+                stream.next().await
+            } else {
+                tokio::time::timeout(timeout_duration, stream.next())
+                    .await
+                    .map_err(|_| {
+                        if is_first_chunk {
+                            ProxyError::Timeout(format!(
+                                "流式响应首字节超时: {}秒",
+                                timeout_duration.as_secs()
+                            ))
+                        } else {
+                            ProxyError::StreamIdleTimeout(timeout_duration.as_secs())
+                        }
+                    })?
+            };
+
+            match next_chunk {
+                Some(Ok(bytes)) => {
+                    is_first_chunk = false;
+                    if bytes.is_empty() {
+                        continue;
+                    }
+
+                    sse_buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    buffered_chunks.push(bytes);
+
+                    let events = drain_sse_json_events(&mut sse_buffer);
+                    if first_upstream_event_ms.is_none() && !events.is_empty() {
+                        first_upstream_event_ms =
+                            Some(attempt_started_at.elapsed().as_millis() as u64);
+                    }
+                    if events.iter().any(is_meaningful_codex_stream_event) {
+                        self.router
+                            .reset_semantic_failure_streak(provider_id, app_type_str)
+                            .await;
+                        let first_token_ms = first_upstream_event_ms
+                            .unwrap_or_else(|| attempt_started_at.elapsed().as_millis() as u64);
+                        return Ok(SemanticValidationOutcome::Success(
+                            ProxyResponse::from_stream(
+                                status,
+                                headers,
+                                prepend_buffered_stream(buffered_chunks, stream),
+                            )
+                            .with_timing(ResponseTiming {
+                                upstream_started_at: Some(attempt_started_at),
+                                upstream_first_token_ms: Some(first_token_ms),
+                                upstream_first_token_known: true,
+                                upstream_duration_ms: None,
+                            }),
+                        ));
+                    }
+                }
+                Some(Err(e)) => {
+                    return Err(ProxyError::ForwardFailed(format!(
+                        "流式响应读取失败: {e}"
+                    )));
+                }
+                None => break,
+            }
+        }
+
+        if !sse_buffer.trim().is_empty() {
+            sse_buffer.push_str("\n\n");
+            let events = drain_sse_json_events(&mut sse_buffer);
+            if first_upstream_event_ms.is_none() && !events.is_empty() {
+                first_upstream_event_ms = Some(attempt_started_at.elapsed().as_millis() as u64);
+            }
+            if events.iter().any(is_meaningful_codex_stream_event) {
+                self.router
+                    .reset_semantic_failure_streak(provider_id, app_type_str)
+                    .await;
+                let elapsed_ms = attempt_started_at.elapsed().as_millis() as u64;
+                let first_token_ms = first_upstream_event_ms.unwrap_or(elapsed_ms);
+                let response =
+                    ProxyResponse::from_stream(status, headers, buffered_only_stream(buffered_chunks))
+                        .with_timing(ResponseTiming {
+                            upstream_started_at: Some(attempt_started_at),
+                            upstream_first_token_ms: Some(first_token_ms),
+                            upstream_first_token_known: true,
+                            upstream_duration_ms: Some(elapsed_ms),
+                        });
+                return Ok(SemanticValidationOutcome::Success(response));
+            }
+        }
+
+        let streak = self
+            .router
+            .record_semantic_failure(provider_id, app_type_str)
+            .await;
+        let base_message = "上游流式响应未产出有效内容，usage 全 0 或缺失";
+
+        if streak < CODEX_SEMANTIC_FAILURE_THRESHOLD {
+            let note = format!("语义异常（{streak}/{CODEX_SEMANTIC_FAILURE_THRESHOLD}）：{base_message}");
+            let elapsed_ms = attempt_started_at.elapsed().as_millis() as u64;
+            let response =
+                ProxyResponse::from_stream(status, headers, buffered_only_stream(buffered_chunks))
+                    .with_timing(ResponseTiming {
+                        upstream_started_at: Some(attempt_started_at),
+                        upstream_first_token_ms: first_upstream_event_ms,
+                        upstream_first_token_known: true,
+                        upstream_duration_ms: Some(elapsed_ms),
+                    });
+            Ok(SemanticValidationOutcome::ToleratedAnomaly {
+                response: response.with_semantic_note(note.clone()),
+                note,
+            })
+        } else {
+            Err(ProxyError::SemanticFailure(format!(
+                "语义异常连续 {streak}/{CODEX_SEMANTIC_FAILURE_THRESHOLD} 次，判定 Provider 失败并切换：{base_message}"
+            )))
+        }
+    }
+
     async fn resolve_claude_api_format(
         &self,
         provider: &Provider,
@@ -1455,6 +1742,7 @@ impl RequestForwarder {
             // 网络和上游错误：都应该尝试下一个供应商
             ProxyError::Timeout(_) => ErrorCategory::Retryable,
             ProxyError::ForwardFailed(_) => ErrorCategory::Retryable,
+            ProxyError::SemanticFailure(_) => ErrorCategory::Retryable,
             ProxyError::ProviderUnhealthy(_) => ErrorCategory::Retryable,
             // 上游 HTTP 错误：无论状态码如何，都尝试下一个供应商
             // 原因：不同供应商有不同的限制和认证，一个供应商的 4xx 错误
@@ -1471,6 +1759,268 @@ impl RequestForwarder {
             _ => ErrorCategory::NonRetryable,
         }
     }
+}
+
+fn prepend_buffered_stream(buffered_chunks: Vec<Bytes>, mut stream: ByteStream) -> ByteStream {
+    Box::pin(async_stream::stream! {
+        for chunk in buffered_chunks {
+            yield Ok(chunk);
+        }
+
+        while let Some(chunk) = stream.next().await {
+            yield chunk;
+        }
+    })
+}
+
+fn buffered_only_stream(buffered_chunks: Vec<Bytes>) -> ByteStream {
+    Box::pin(async_stream::stream! {
+        for chunk in buffered_chunks {
+            yield Ok(chunk);
+        }
+    })
+}
+
+fn drain_sse_json_events(buffer: &mut String) -> Vec<Value> {
+    let mut events = Vec::new();
+
+    while let Some(pos) = buffer.find("\n\n") {
+        let event_text = buffer[..pos].to_string();
+        *buffer = buffer[pos + 2..].to_string();
+
+        if event_text.trim().is_empty() {
+            continue;
+        }
+
+        for line in event_text.lines() {
+            let Some(data) = strip_sse_field(line, "data") else {
+                continue;
+            };
+
+            if data.trim() == "[DONE]" {
+                continue;
+            }
+
+            if let Ok(json_value) = serde_json::from_str::<Value>(data) {
+                events.push(json_value);
+            }
+        }
+    }
+
+    events
+}
+
+fn is_meaningful_codex_stream_event(event: &Value) -> bool {
+    if let Some(event_type) = event.get("type").and_then(|value| value.as_str()) {
+        match event_type {
+            "response.completed" => {
+                return event
+                    .get("response")
+                    .map(is_meaningful_codex_non_streaming_body)
+                    .unwrap_or(false);
+            }
+            "response.reasoning.delta" => {
+                return event
+                    .get("delta")
+                    .and_then(|value| value.as_str())
+                    .map(has_non_empty_text)
+                    .unwrap_or(false);
+            }
+            "response.output_text.delta" => {
+                return event
+                    .get("delta")
+                    .and_then(|value| value.as_str())
+                    .map(has_non_empty_text)
+                    .unwrap_or(false);
+            }
+            "response.content_part.added" => {
+                return event
+                    .get("part")
+                    .and_then(|part| part.get("text"))
+                    .and_then(|value| value.as_str())
+                    .map(has_non_empty_text)
+                    .unwrap_or(false);
+            }
+            "response.output_item.added" => {
+                return event
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(|value| value.as_str())
+                    .map(|item_type| item_type == "function_call")
+                    .unwrap_or(false);
+            }
+            "response.function_call_arguments.delta" => {
+                return event
+                    .get("delta")
+                    .and_then(|value| value.as_str())
+                    .map(has_non_empty_text)
+                    .unwrap_or(false);
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(choices) = event.get("choices").and_then(|value| value.as_array()) {
+        return choices.iter().any(is_meaningful_openai_choice);
+    }
+
+    false
+}
+
+fn is_meaningful_codex_non_streaming_body(body: &Value) -> bool {
+    if TokenUsage::from_codex_response_auto(body)
+        .as_ref()
+        .map(has_non_zero_usage)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if body.get("usage").map(has_non_zero_usage_value).unwrap_or(false) {
+        return true;
+    }
+
+    if body
+        .get("output_text")
+        .and_then(|value| value.as_str())
+        .map(has_non_empty_text)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if body
+        .get("output")
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().any(is_meaningful_response_output_item))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    body.get("choices")
+        .and_then(|value| value.as_array())
+        .map(|choices| choices.iter().any(is_meaningful_openai_choice))
+        .unwrap_or(false)
+}
+
+fn is_meaningful_response_output_item(item: &Value) -> bool {
+    match item.get("type").and_then(|value| value.as_str()) {
+        Some("message") => item
+            .get("content")
+            .and_then(|value| value.as_array())
+            .map(|content| content.iter().any(is_meaningful_message_content_block))
+            .unwrap_or(false),
+        Some("function_call") | Some("function_call_output") => true,
+        Some("reasoning") => false,
+        _ => false,
+    }
+}
+
+fn is_meaningful_message_content_block(block: &Value) -> bool {
+    match block.get("type").and_then(|value| value.as_str()) {
+        Some("output_text") | Some("input_text") | Some("text") => block
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(has_non_empty_text)
+            .unwrap_or(false),
+        Some("refusal") => block
+            .get("refusal")
+            .and_then(|value| value.as_str())
+            .map(has_non_empty_text)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn is_meaningful_openai_choice(choice: &Value) -> bool {
+    if choice
+        .pointer("/delta/content")
+        .and_then(|value| value.as_str())
+        .map(has_non_empty_text)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if choice
+        .pointer("/message/content")
+        .map(value_has_non_empty_text)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    choice
+        .pointer("/delta/tool_calls")
+        .and_then(|value| value.as_array())
+        .map(|tool_calls| !tool_calls.is_empty())
+        .unwrap_or(false)
+        || choice
+            .pointer("/message/tool_calls")
+            .and_then(|value| value.as_array())
+            .map(|tool_calls| !tool_calls.is_empty())
+            .unwrap_or(false)
+}
+
+fn value_has_non_empty_text(value: &Value) -> bool {
+    match value {
+        Value::String(text) => has_non_empty_text(text),
+        Value::Array(items) => items.iter().any(|item| {
+            item.get("text")
+                .and_then(|value| value.as_str())
+                .map(has_non_empty_text)
+                .unwrap_or(false)
+                || item
+                    .get("refusal")
+                    .and_then(|value| value.as_str())
+                    .map(has_non_empty_text)
+                    .unwrap_or(false)
+        }),
+        _ => false,
+    }
+}
+
+fn has_non_zero_usage(usage: &TokenUsage) -> bool {
+    usage.input_tokens > 0
+        || usage.output_tokens > 0
+        || usage.cache_read_tokens > 0
+        || usage.cache_creation_tokens > 0
+}
+
+fn has_non_zero_usage_value(usage: &Value) -> bool {
+    let keys = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+    ];
+
+    if keys
+        .iter()
+        .any(|key| usage.get(*key).and_then(|value| value.as_u64()).unwrap_or(0) > 0)
+    {
+        return true;
+    }
+
+    usage.get("input_tokens_details")
+        .and_then(|value| value.get("cached_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+        > 0
+        || usage
+            .get("prompt_tokens_details")
+            .and_then(|value| value.get("cached_tokens"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+            > 0
+}
+
+fn has_non_empty_text(text: &str) -> bool {
+    !text.is_empty()
 }
 
 /// 从 ProxyError 中提取错误消息
@@ -1554,6 +2104,9 @@ fn summarize_proxy_error(error: &ProxyError) -> String {
         }
         ProxyError::ForwardFailed(message) => {
             format!("请求转发失败: {}", summarize_text_for_log(message, 180))
+        }
+        ProxyError::SemanticFailure(message) => {
+            format!("语义失败: {}", summarize_text_for_log(message, 180))
         }
         ProxyError::TransformError(message) => {
             format!("响应转换失败: {}", summarize_text_for_log(message, 180))
@@ -1710,17 +2263,22 @@ mod tests {
     use super::*;
     use crate::AppError;
     use crate::database::Database;
+    use crate::proxy::circuit_breaker::CircuitBreakerConfig;
     use crate::proxy::failover_switch::FailoverSwitchManager;
     use crate::proxy::provider_router::ProviderRouter;
     use crate::proxy::types::ProxyStatus;
+    use axum::body::Body;
     use axum::http::header::{HeaderValue, ACCEPT};
     use axum::http::HeaderMap;
+    use axum::response::Response;
     use axum::{routing::post, Json, Router};
+    use bytes::Bytes;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::sync::RwLock;
+    use tokio::time::{sleep, Duration};
 
     fn build_test_provider(id: &str, name: &str, base_url: &str) -> crate::provider::Provider {
         crate::provider::Provider {
@@ -1771,6 +2329,77 @@ mod tests {
 
     async fn start_test_server(status: u16, body: serde_json::Value) -> String {
         start_test_server_for_path("/v1/responses", status, body).await
+    }
+
+    async fn start_test_sse_server_for_path(
+        path: &'static str,
+        status: u16,
+        chunks: Vec<&'static str>,
+    ) -> String {
+        let app = Router::new().route(
+            path,
+            post(move || {
+                let chunks = chunks.clone();
+                async move {
+                    let stream = futures::stream::iter(chunks.into_iter().map(|chunk| {
+                        Ok::<Bytes, std::io::Error>(Bytes::from(chunk.to_string()))
+                    }));
+
+                    Response::builder()
+                        .status(axum::http::StatusCode::from_u16(status).expect("valid status"))
+                        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .expect("build sse response")
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+        format!("http://{}", addr)
+    }
+
+    async fn start_test_delayed_sse_server_for_path(
+        path: &'static str,
+        status: u16,
+        chunks: Vec<(&'static str, u64)>,
+    ) -> String {
+        let app = Router::new().route(
+            path,
+            post(move || {
+                let chunks = chunks.clone();
+                async move {
+                    let stream = async_stream::stream! {
+                        for (chunk, delay_ms) in chunks {
+                            if delay_ms > 0 {
+                                sleep(Duration::from_millis(delay_ms)).await;
+                            }
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk.to_string()));
+                        }
+                    };
+
+                    Response::builder()
+                        .status(axum::http::StatusCode::from_u16(status).expect("valid status"))
+                        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .expect("build delayed sse response")
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve delayed sse app");
+        });
+        format!("http://{}", addr)
     }
 
     #[test]
@@ -2285,6 +2914,564 @@ mod tests {
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         assert_eq!(model, "gemini-2.5-pro");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn codex_non_streaming_semantic_empty_response_should_failover_on_third_hit() -> Result<(), AppError> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let db = Arc::new(Database::memory()?);
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 60,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let router = Arc::new(ProviderRouter::new(db.clone()));
+        let failover_manager = Arc::new(FailoverSwitchManager::new(db.clone()));
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        let current_providers = Arc::new(RwLock::new(HashMap::new()));
+
+        let empty_base_url = start_test_server(
+            200,
+            json!({
+                "id": "resp_empty",
+                "status": "completed",
+                "model": "gpt-5",
+                "output": [],
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "input_tokens_details": {
+                        "cached_tokens": 0
+                    }
+                }
+            }),
+        )
+        .await;
+        let success_base_url = start_test_server(
+            200,
+            json!({
+                "id": "resp_ok",
+                "status": "completed",
+                "model": "gpt-5",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Hello from provider B"
+                    }]
+                }],
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 6
+                }
+            }),
+        )
+        .await;
+
+        let forwarder = RequestForwarder::new(
+            router,
+            5,
+            status,
+            current_providers,
+            failover_manager,
+            None,
+            "provider-a".to_string(),
+            0,
+            0,
+            RectifierConfig::default(),
+            OptimizerConfig::default(),
+            CopilotOptimizerConfig::default(),
+        );
+
+        let providers = vec![
+            build_test_provider("provider-a", "Provider A", &empty_base_url),
+            build_test_provider("provider-b", "Provider B", &success_base_url),
+        ];
+
+        for expected_streak in 1..=2 {
+            let result = forwarder
+                .forward_with_retry(
+                    &AppType::Codex,
+                    "/responses",
+                    json!({
+                        "model": "gpt-5",
+                        "input": "hello"
+                    }),
+                    HeaderMap::new(),
+                    Extensions::new(),
+                    providers.clone(),
+                )
+                .await
+                .map_err(|e| AppError::Message(format!("semantic anomaly should be tolerated before threshold: {}", e.error)))?;
+
+            assert_eq!(result.provider.id, "provider-a");
+            let semantic_note = result
+                .response
+                .semantic_note()
+                .map(str::to_string)
+                .ok_or_else(|| AppError::Message("expected semantic anomaly note".to_string()))?;
+            assert!(
+                semantic_note.contains(&format!("{expected_streak}/3")),
+                "semantic anomaly note should expose current streak: {semantic_note}"
+            );
+
+            let body_bytes = result
+                .response
+                .bytes()
+                .await
+                .map_err(|e| AppError::Message(e.to_string()))?;
+            let body_json: Value = serde_json::from_slice(&body_bytes)
+                .map_err(|e| AppError::Message(e.to_string()))?;
+            assert_eq!(body_json["id"], "resp_empty");
+
+            let allow_result = forwarder
+                .router
+                .allow_provider_request("provider-a", "codex")
+                .await;
+            assert!(
+                allow_result.allowed,
+                "semantic anomaly {expected_streak}/3 should not trip circuit yet"
+            );
+        }
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                "/responses",
+                json!({
+                    "model": "gpt-5",
+                    "input": "hello"
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                providers,
+            )
+            .await
+            .map_err(|e| AppError::Message(format!("third semantic anomaly should failover: {}", e.error)))?;
+
+        assert_eq!(result.provider.id, "provider-b");
+
+        let body_bytes = result
+            .response
+            .bytes()
+            .await
+            .map_err(|e| AppError::Message(e.to_string()))?;
+        let body_json: Value = serde_json::from_slice(&body_bytes)
+            .map_err(|e| AppError::Message(e.to_string()))?;
+        assert_eq!(body_json["id"], "resp_ok");
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let error_message: String = conn
+            .query_row(
+                "SELECT error_message
+                 FROM proxy_request_logs
+                 WHERE provider_id = 'provider-a'
+                   AND status_code = 502
+                 LIMIT 1",
+                [],
+                |row: &rusqlite::Row<'_>| row.get(0),
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        assert!(
+            error_message.contains("连续 3/3 次"),
+            "third semantic failure should explain threshold breach: {error_message}"
+        );
+
+        let allow_result = forwarder
+            .router
+            .allow_provider_request("provider-a", "codex")
+            .await;
+        assert!(
+            !allow_result.allowed,
+            "third semantic failure should be counted into the circuit breaker"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn codex_streaming_semantic_empty_response_should_failover_on_third_hit() -> Result<(), AppError> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let db = Arc::new(Database::memory()?);
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 60,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let router = Arc::new(ProviderRouter::new(db.clone()));
+        let failover_manager = Arc::new(FailoverSwitchManager::new(db.clone()));
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        let current_providers = Arc::new(RwLock::new(HashMap::new()));
+
+        let empty_base_url = start_test_sse_server_for_path(
+            "/v1/responses",
+            200,
+            vec![concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_empty\",\"model\":\"gpt-5\"}}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_empty\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"input_tokens_details\":{\"cached_tokens\":0}}}}\n\n"
+            )],
+        )
+        .await;
+        let success_base_url = start_test_sse_server_for_path(
+            "/v1/responses",
+            200,
+            vec![concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\",\"model\":\"gpt-5\"}}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello from provider B\"}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":12,\"output_tokens\":6}}}\n\n"
+            )],
+        )
+        .await;
+
+        let forwarder = RequestForwarder::new(
+            router,
+            5,
+            status,
+            current_providers,
+            failover_manager,
+            None,
+            "provider-a".to_string(),
+            5,
+            5,
+            RectifierConfig::default(),
+            OptimizerConfig::default(),
+            CopilotOptimizerConfig::default(),
+        );
+
+        let providers = vec![
+            build_test_provider("provider-a", "Provider A", &empty_base_url),
+            build_test_provider("provider-b", "Provider B", &success_base_url),
+        ];
+
+        for expected_streak in 1..=2 {
+            let result = forwarder
+                .forward_with_retry(
+                    &AppType::Codex,
+                    "/responses",
+                    json!({
+                        "model": "gpt-5",
+                        "input": "hello",
+                        "stream": true
+                    }),
+                    HeaderMap::new(),
+                    Extensions::new(),
+                    providers.clone(),
+                )
+                .await
+                .map_err(|e| AppError::Message(format!("semantic stream anomaly should be tolerated before threshold: {}", e.error)))?;
+
+            assert_eq!(result.provider.id, "provider-a");
+            assert!(result.response.is_sse(), "should keep streaming response semantics");
+            let semantic_note = result
+                .response
+                .semantic_note()
+                .map(str::to_string)
+                .ok_or_else(|| AppError::Message("expected semantic anomaly note".to_string()))?;
+            assert!(
+                semantic_note.contains(&format!("{expected_streak}/3")),
+                "semantic stream anomaly note should expose current streak: {semantic_note}"
+            );
+
+            let sse_text = String::from_utf8(
+                result
+                    .response
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::Message(e.to_string()))?
+                    .to_vec(),
+            )
+            .map_err(|e| AppError::Message(e.to_string()))?;
+            assert!(sse_text.contains("resp_empty"));
+
+            let allow_result = forwarder
+                .router
+                .allow_provider_request("provider-a", "codex")
+                .await;
+            assert!(
+                allow_result.allowed,
+                "semantic stream anomaly {expected_streak}/3 should not trip circuit yet"
+            );
+        }
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                "/responses",
+                json!({
+                    "model": "gpt-5",
+                    "input": "hello",
+                    "stream": true
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                providers,
+            )
+            .await
+            .map_err(|e| AppError::Message(format!("third semantic stream anomaly should failover: {}", e.error)))?;
+
+        assert_eq!(result.provider.id, "provider-b");
+        assert!(result.response.is_sse(), "should keep streaming response semantics");
+
+        let sse_text = String::from_utf8(
+            result
+                .response
+                .bytes()
+                .await
+                .map_err(|e| AppError::Message(e.to_string()))?
+                .to_vec(),
+        )
+        .map_err(|e| AppError::Message(e.to_string()))?;
+        assert!(sse_text.contains("Hello from provider B"));
+        assert!(!sse_text.contains("resp_empty"));
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let error_message: String = conn
+            .query_row(
+                "SELECT error_message
+                 FROM proxy_request_logs
+                 WHERE provider_id = 'provider-a'
+                   AND status_code = 502
+                 LIMIT 1",
+                [],
+                |row: &rusqlite::Row<'_>| row.get(0),
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        assert!(
+            error_message.contains("连续 3/3 次"),
+            "third semantic stream failure should explain threshold breach: {error_message}"
+        );
+
+        let allow_result = forwarder
+            .router
+            .allow_provider_request("provider-a", "codex")
+            .await;
+        assert!(
+            !allow_result.allowed,
+            "third semantic stream failure should be counted into the circuit breaker"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn codex_streaming_semantic_success_should_capture_upstream_first_token_timing()
+    -> Result<(), AppError> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let db = Arc::new(Database::memory()?);
+        let router = Arc::new(ProviderRouter::new(db.clone()));
+        let failover_manager = Arc::new(FailoverSwitchManager::new(db));
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        let current_providers = Arc::new(RwLock::new(HashMap::new()));
+
+        let base_url = start_test_delayed_sse_server_for_path(
+            "/v1/responses",
+            200,
+            vec![
+                (
+                    concat!(
+                        "event: response.created\n",
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\",\"model\":\"gpt-5\"}}\n\n"
+                    ),
+                    40,
+                ),
+                (
+                    concat!(
+                        "event: response.output_text.delta\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n"
+                    ),
+                    40,
+                ),
+                (
+                    concat!(
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":12,\"output_tokens\":6}}}\n\n"
+                    ),
+                    40,
+                ),
+            ],
+        )
+        .await;
+
+        let forwarder = RequestForwarder::new(
+            router,
+            5,
+            status,
+            current_providers,
+            failover_manager,
+            None,
+            "provider-a".to_string(),
+            5,
+            5,
+            RectifierConfig::default(),
+            OptimizerConfig::default(),
+            CopilotOptimizerConfig::default(),
+        );
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                "/responses",
+                json!({
+                    "model": "gpt-5",
+                    "input": "hello",
+                    "stream": true
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![build_test_provider("provider-a", "Provider A", &base_url)],
+            )
+            .await
+            .map_err(|e| AppError::Message(format!("codex semantic success should not fail: {}", e.error)))?;
+
+        let timing = result
+            .response
+            .timing()
+            .ok_or_else(|| AppError::Message("expected upstream timing metadata".to_string()))?;
+        assert!(
+            timing.upstream_started_at.is_some(),
+            "successful codex stream should preserve final upstream attempt start"
+        );
+        let first_token_ms = timing
+            .upstream_first_token_ms
+            .ok_or_else(|| AppError::Message("expected upstream first token timing".to_string()))?;
+        assert!(
+            (20..180).contains(&first_token_ms),
+            "first token timing should reflect the first upstream event, got {first_token_ms}ms"
+        );
+
+        let sse_text = String::from_utf8(
+            result
+                .response
+                .bytes()
+                .await
+                .map_err(|e| AppError::Message(e.to_string()))?
+                .to_vec(),
+        )
+        .map_err(|e| AppError::Message(e.to_string()))?;
+        assert!(sse_text.contains("Hello"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn codex_streaming_first_upstream_event_should_count_as_first_token_timing()
+    -> Result<(), AppError> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let db = Arc::new(Database::memory()?);
+        let router = Arc::new(ProviderRouter::new(db.clone()));
+        let failover_manager = Arc::new(FailoverSwitchManager::new(db));
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        let current_providers = Arc::new(RwLock::new(HashMap::new()));
+
+        let base_url = start_test_delayed_sse_server_for_path(
+            "/v1/responses",
+            200,
+            vec![
+                (
+                    concat!(
+                        "event: response.created\n",
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_reasoning\",\"model\":\"gpt-5\"}}\n\n"
+                    ),
+                    40,
+                ),
+                (
+                    concat!(
+                        "event: response.reasoning.delta\n",
+                        "data: {\"type\":\"response.reasoning.delta\",\"delta\":\"Let me think...\"}\n\n"
+                    ),
+                    220,
+                ),
+                (
+                    concat!(
+                        "event: response.output_text.delta\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Answer\"}\n\n"
+                    ),
+                    40,
+                ),
+                (
+                    concat!(
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reasoning\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":12,\"output_tokens\":6}}}\n\n"
+                    ),
+                    40,
+                ),
+            ],
+        )
+        .await;
+
+        let forwarder = RequestForwarder::new(
+            router,
+            5,
+            status,
+            current_providers,
+            failover_manager,
+            None,
+            "provider-a".to_string(),
+            5,
+            5,
+            RectifierConfig::default(),
+            OptimizerConfig::default(),
+            CopilotOptimizerConfig::default(),
+        );
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                "/responses",
+                json!({
+                    "model": "gpt-5",
+                    "input": "hello",
+                    "stream": true
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![build_test_provider("provider-a", "Provider A", &base_url)],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Message(format!(
+                    "codex reasoning delta should not fail semantic validation: {}",
+                    e.error
+                ))
+            })?;
+
+        let timing = result
+            .response
+            .timing()
+            .ok_or_else(|| AppError::Message("expected upstream timing metadata".to_string()))?;
+        let first_token_ms = timing
+            .upstream_first_token_ms
+            .ok_or_else(|| AppError::Message("expected upstream first token timing".to_string()))?;
+
+        assert!(
+            (20..180).contains(&first_token_ms),
+            "first upstream event should be treated as first token timing, got {first_token_ms}ms"
+        );
+
+        let sse_text = String::from_utf8(
+            result
+                .response
+                .bytes()
+                .await
+                .map_err(|e| AppError::Message(e.to_string()))?
+                .to_vec(),
+        )
+        .map_err(|e| AppError::Message(e.to_string()))?;
+        assert!(sse_text.contains("Answer"));
+
         Ok(())
     }
 }

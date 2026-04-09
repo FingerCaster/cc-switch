@@ -6,11 +6,13 @@
 
 use super::ProxyError;
 use bytes::Bytes;
-use futures::stream::Stream;
+use futures::stream::{Stream, StreamExt};
 use http_body_util::BodyExt;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use std::pin::Pin;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 /// Our own header case map: maps lowercase header name → original wire-casing bytes.
 ///
@@ -76,16 +78,150 @@ fn global_hyper_client() -> &'static HyperClient {
 ///
 /// The hyper variant is used for the main (direct) path with header-case preservation.
 /// The reqwest variant is the fallback when an upstream HTTP/SOCKS5 proxy is configured.
+pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResponseTiming {
+    pub upstream_started_at: Option<Instant>,
+    pub upstream_first_token_ms: Option<u64>,
+    pub upstream_first_token_known: bool,
+    pub upstream_duration_ms: Option<u64>,
+}
+
 pub enum ProxyResponse {
     Hyper(hyper::Response<hyper::body::Incoming>),
     Reqwest(reqwest::Response),
+    Buffered {
+        status: http::StatusCode,
+        headers: http::HeaderMap,
+        body: Bytes,
+        semantic_note: Option<String>,
+        timing: ResponseTiming,
+    },
+    Stream {
+        status: http::StatusCode,
+        headers: http::HeaderMap,
+        stream: ByteStream,
+        semantic_note: Option<String>,
+        timing: ResponseTiming,
+    },
 }
 
 impl ProxyResponse {
+    pub fn from_buffered(
+        status: http::StatusCode,
+        headers: http::HeaderMap,
+        body: Bytes,
+    ) -> Self {
+        Self::Buffered {
+            status,
+            headers,
+            body,
+            semantic_note: None,
+            timing: ResponseTiming::default(),
+        }
+    }
+
+    pub fn from_stream(
+        status: http::StatusCode,
+        headers: http::HeaderMap,
+        stream: ByteStream,
+    ) -> Self {
+        Self::Stream {
+            status,
+            headers,
+            stream,
+            semantic_note: None,
+            timing: ResponseTiming::default(),
+        }
+    }
+
+    pub fn with_semantic_note(self, note: impl Into<String>) -> Self {
+        let note = Some(note.into());
+        match self {
+            Self::Buffered {
+                status,
+                headers,
+                body,
+                timing,
+                ..
+            } => Self::Buffered {
+                status,
+                headers,
+                body,
+                semantic_note: note,
+                timing,
+            },
+            Self::Stream {
+                status,
+                headers,
+                stream,
+                timing,
+                ..
+            } => Self::Stream {
+                status,
+                headers,
+                stream,
+                semantic_note: note,
+                timing,
+            },
+            other => other,
+        }
+    }
+
+    pub fn with_timing(self, timing: ResponseTiming) -> Self {
+        match self {
+            Self::Buffered {
+                status,
+                headers,
+                body,
+                semantic_note,
+                ..
+            } => Self::Buffered {
+                status,
+                headers,
+                body,
+                semantic_note,
+                timing,
+            },
+            Self::Stream {
+                status,
+                headers,
+                stream,
+                semantic_note,
+                ..
+            } => Self::Stream {
+                status,
+                headers,
+                stream,
+                semantic_note,
+                timing,
+            },
+            other => other,
+        }
+    }
+
+    pub fn timing(&self) -> Option<ResponseTiming> {
+        match self {
+            Self::Buffered { timing, .. } | Self::Stream { timing, .. } => Some(*timing),
+            Self::Hyper(_) | Self::Reqwest(_) => None,
+        }
+    }
+
+    pub fn semantic_note(&self) -> Option<&str> {
+        match self {
+            Self::Buffered { semantic_note, .. } | Self::Stream { semantic_note, .. } => {
+                semantic_note.as_deref()
+            }
+            Self::Hyper(_) | Self::Reqwest(_) => None,
+        }
+    }
+
     pub fn status(&self) -> http::StatusCode {
         match self {
             Self::Hyper(r) => r.status(),
             Self::Reqwest(r) => r.status(),
+            Self::Buffered { status, .. } | Self::Stream { status, .. } => *status,
         }
     }
 
@@ -93,6 +229,7 @@ impl ProxyResponse {
         match self {
             Self::Hyper(r) => r.headers(),
             Self::Reqwest(r) => r.headers(),
+            Self::Buffered { headers, .. } | Self::Stream { headers, .. } => headers,
         }
     }
 
@@ -122,13 +259,22 @@ impl ProxyResponse {
             Self::Reqwest(r) => r.bytes().await.map_err(|e| {
                 ProxyError::ForwardFailed(format!("Failed to read response body: {e}"))
             }),
+            Self::Buffered { body, .. } => Ok(body),
+            Self::Stream { mut stream, .. } => {
+                let mut collected = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| {
+                        ProxyError::ForwardFailed(format!("Failed to read response body: {e}"))
+                    })?;
+                    collected.extend_from_slice(&chunk);
+                }
+                Ok(Bytes::from(collected))
+            }
         }
     }
 
     /// Consume the response and return a byte-chunk stream (for SSE pass-through).
-    pub fn bytes_stream(self) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
-        use futures::StreamExt;
-
+    pub fn bytes_stream(self) -> ByteStream {
         match self {
             Self::Hyper(r) => {
                 let body = r.into_body();
@@ -152,8 +298,7 @@ impl ProxyResponse {
                 .filter(|result| {
                     futures::future::ready(!matches!(result, Ok(ref b) if b.is_empty()))
                 });
-                Box::pin(stream)
-                    as std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>
+                Box::pin(stream) as ByteStream
             }
             Self::Reqwest(r) => {
                 let stream = r
@@ -161,6 +306,10 @@ impl ProxyResponse {
                     .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
                 Box::pin(stream)
             }
+            Self::Buffered { body, .. } => {
+                Box::pin(futures::stream::once(async move { Ok(body) }))
+            }
+            Self::Stream { stream, .. } => stream,
         }
     }
 }

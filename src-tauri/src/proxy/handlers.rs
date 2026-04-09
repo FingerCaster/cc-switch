@@ -631,7 +631,9 @@ async fn log_usage(
         multiplier,
         latency_ms,
         first_token_ms,
+        latency_ms,
         status_code,
+        None,
         None,
         None, // provider_type
         is_streaming,

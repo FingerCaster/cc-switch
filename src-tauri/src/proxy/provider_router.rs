@@ -18,6 +18,8 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// 语义空响应连续计数 - key 格式: "app_type:provider_id"
+    semantic_failure_streaks: Arc<RwLock<HashMap<String, u32>>>,
 }
 
 impl ProviderRouter {
@@ -26,6 +28,7 @@ impl ProviderRouter {
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            semantic_failure_streaks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -145,6 +148,9 @@ impl ProviderRouter {
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
 
+        self.reset_semantic_failure_streak(provider_id, app_type)
+            .await;
+
         if success {
             breaker.record_success(used_half_open_permit).await;
         } else {
@@ -163,6 +169,20 @@ impl ProviderRouter {
             .await?;
 
         Ok(())
+    }
+
+    pub async fn record_semantic_failure(&self, provider_id: &str, app_type: &str) -> u32 {
+        let key = format!("{app_type}:{provider_id}");
+        let mut streaks = self.semantic_failure_streaks.write().await;
+        let streak = streaks.entry(key).or_insert(0);
+        *streak += 1;
+        *streak
+    }
+
+    pub async fn reset_semantic_failure_streak(&self, provider_id: &str, app_type: &str) {
+        let key = format!("{app_type}:{provider_id}");
+        let mut streaks = self.semantic_failure_streaks.write().await;
+        streaks.remove(&key);
     }
 
     /// 重置熔断器（手动恢复）

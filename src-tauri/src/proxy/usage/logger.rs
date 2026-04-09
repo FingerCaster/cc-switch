@@ -20,6 +20,7 @@ pub struct RequestLog {
     pub cost: Option<CostBreakdown>,
     pub latency_ms: u64,
     pub first_token_ms: Option<u64>,
+    pub duration_ms: Option<u64>,
     pub status_code: u16,
     pub error_message: Option<String>,
     pub session_id: Option<String>,
@@ -77,9 +78,9 @@ impl<'a> UsageLogger<'a> {
                 request_id, provider_id, app_type, model, request_model,
                 input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                 input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
-                latency_ms, first_token_ms, status_code, error_message, session_id,
+                latency_ms, first_token_ms, duration_ms, status_code, error_message, session_id,
                 provider_type, is_streaming, cost_multiplier, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             rusqlite::params![
                 log.request_id,
                 log.provider_id,
@@ -97,6 +98,7 @@ impl<'a> UsageLogger<'a> {
                 total_cost,
                 log.latency_ms as i64,
                 log.first_token_ms.map(|v| v as i64),
+                log.duration_ms.map(|v| v as i64),
                 log.status_code as i64,
                 log.error_message,
                 log.session_id,
@@ -136,6 +138,7 @@ impl<'a> UsageLogger<'a> {
             cost: None,
             latency_ms,
             first_token_ms: None,
+            duration_ms: Some(latency_ms),
             status_code,
             error_message: Some(error_message),
             session_id: None,
@@ -175,6 +178,7 @@ impl<'a> UsageLogger<'a> {
             cost: None,
             latency_ms,
             first_token_ms: None,
+            duration_ms: Some(latency_ms),
             status_code,
             error_message: Some(error_message),
             session_id,
@@ -296,8 +300,10 @@ impl<'a> UsageLogger<'a> {
         cost_multiplier: Decimal,
         latency_ms: u64,
         first_token_ms: Option<u64>,
+        duration_ms: u64,
         status_code: u16,
         session_id: Option<String>,
+        error_message: Option<String>,
         provider_type: Option<String>,
         is_streaming: bool,
     ) -> Result<(), AppError> {
@@ -319,8 +325,9 @@ impl<'a> UsageLogger<'a> {
             cost,
             latency_ms,
             first_token_ms,
+            duration_ms: Some(duration_ms),
             status_code,
-            error_message: None,
+            error_message,
             session_id,
             provider_type,
             is_streaming,
@@ -371,7 +378,9 @@ mod tests {
             Decimal::from(1),
             100,
             None,
+            100,
             200,
+            None,
             None,
             Some("claude".to_string()),
             false,
@@ -379,15 +388,19 @@ mod tests {
 
         // 验证记录已插入
         let conn = crate::database::lock_conn!(db.conn);
-        let (count, request_model): (i64, String) = conn
+        let (count, request_model, latency_ms, duration_ms): (i64, String, i64, Option<i64>) = conn
             .query_row(
-                "SELECT COUNT(*), request_model FROM proxy_request_logs WHERE request_id = 'req-123'",
+                "SELECT COUNT(*), request_model, latency_ms, duration_ms
+                 FROM proxy_request_logs
+                 WHERE request_id = 'req-123'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(request_model, "req-model");
+        assert_eq!(latency_ms, 100);
+        assert_eq!(duration_ms, Some(100));
         Ok(())
     }
 
