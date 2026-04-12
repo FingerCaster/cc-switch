@@ -28,22 +28,25 @@ import {
   parseFiniteNumber,
 } from "./format";
 import { UsageTimeRangePicker } from "./UsageTimeRangePicker";
-import {
-  getUsageTimeRangeValue,
-  type UsageTimeRangeValue,
-} from "./timeRange";
+import { getUsageTimeRangeValue, type UsageTimeRangeValue } from "./timeRange";
 
 interface RequestLogTableProps {
+  appType?: string;
   refreshIntervalMs: number;
 }
 
-export function RequestLogTable({ refreshIntervalMs }: RequestLogTableProps) {
+export function RequestLogTable({
+  appType: dashboardAppType,
+  refreshIntervalMs,
+}: RequestLogTableProps) {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
-  const [selectedRange, setSelectedRange] = useState<UsageTimeRangeValue>(() => {
-    const todayRange = getUsageTimeRangeValue("today");
-    return todayRange;
-  });
+  const [selectedRange, setSelectedRange] = useState<UsageTimeRangeValue>(
+    () => {
+      const todayRange = getUsageTimeRangeValue("today");
+      return todayRange;
+    },
+  );
   const [appliedRange, setAppliedRange] = useState<UsageTimeRangeValue>(() =>
     getUsageTimeRangeValue("today"),
   );
@@ -52,8 +55,14 @@ export function RequestLogTable({ refreshIntervalMs }: RequestLogTableProps) {
   const [page, setPage] = useState(0);
   const pageSize = 20;
 
+  // When dashboard-level app filter is active (not "all"), override the local appType filter
+  const dashboardAppTypeActive = dashboardAppType && dashboardAppType !== "all";
+  const effectiveFilters: LogFilters = dashboardAppTypeActive
+    ? { ...appliedFilters, appType: dashboardAppType }
+    : appliedFilters;
+
   const { data: result, isLoading } = useRequestLogs({
-    filters: appliedFilters,
+    filters: effectiveFilters,
     range: appliedRange,
     page,
     pageSize,
@@ -105,13 +114,18 @@ export function RequestLogTable({ refreshIntervalMs }: RequestLogTableProps) {
             className="h-10 min-w-[140px]"
           />
           <Select
-            value={draftFilters.appType || "all"}
+            value={
+              dashboardAppTypeActive
+                ? dashboardAppType
+                : draftFilters.appType || "all"
+            }
             onValueChange={(v) =>
               setDraftFilters({
                 ...draftFilters,
                 appType: v === "all" ? undefined : v,
               })
             }
+            disabled={!!dashboardAppTypeActive}
           >
             <SelectTrigger className="w-[130px] bg-background">
               <SelectValue placeholder={t("usage.appType")} />
@@ -253,13 +267,16 @@ export function RequestLogTable({ refreshIntervalMs }: RequestLogTableProps) {
                   <TableHead className="whitespace-nowrap">
                     {t("usage.status")}
                   </TableHead>
+                  <TableHead className="whitespace-nowrap">
+                    {t("usage.source", { defaultValue: "Source" })}
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {logs.length === 0 ? (
                   <TableRow>
                     <TableCell
-                      colSpan={11}
+                      colSpan={12}
                       className="text-center text-muted-foreground"
                     >
                       {t("usage.noData")}
@@ -387,6 +404,21 @@ export function RequestLogTable({ refreshIntervalMs }: RequestLogTableProps) {
                         >
                           {log.statusCode}
                         </span>
+                      </TableCell>
+                      <TableCell>
+                        {log.dataSource && log.dataSource !== "proxy" ? (
+                          <span className="inline-flex rounded-full px-2 py-0.5 text-[10px] bg-indigo-100 text-indigo-800">
+                            {t(`usage.dataSource.${log.dataSource}`, {
+                              defaultValue: log.dataSource,
+                            })}
+                          </span>
+                        ) : (
+                          <span className="inline-flex rounded-full px-2 py-0.5 text-[10px] bg-gray-100 text-gray-600">
+                            {t("usage.dataSource.proxy", {
+                              defaultValue: "Proxy",
+                            })}
+                          </span>
+                        )}
                       </TableCell>
                     </TableRow>
                   ))

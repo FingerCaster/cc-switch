@@ -38,8 +38,10 @@ export const usageKeys = {
     [...usageKeys.all, "summary", startDate, endDate] as const,
   trends: (startDate: number, endDate: number) =>
     [...usageKeys.all, "trends", startDate, endDate] as const,
-  providerStats: () => [...usageKeys.all, "provider-stats"] as const,
-  modelStats: () => [...usageKeys.all, "model-stats"] as const,
+  providerStats: (appType?: string) =>
+    [...usageKeys.all, "provider-stats", appType ?? "all"] as const,
+  modelStats: (appType?: string) =>
+    [...usageKeys.all, "model-stats", appType ?? "all"] as const,
   logs: (key: RequestLogsKey, page: number, pageSize: number) =>
     [
       ...usageKeys.all,
@@ -76,7 +78,7 @@ export function useUsageSummary(
       );
     },
     refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS, // 每30秒自动刷新
-    refetchIntervalInBackground: options?.refetchIntervalInBackground ?? false, // 后台不刷新
+    refetchIntervalInBackground: options?.refetchIntervalInBackground ?? false,
   });
 }
 
@@ -98,20 +100,25 @@ export function useUsageTrends(
   });
 }
 
-export function useProviderStats(options?: UsageQueryOptions) {
+export function useProviderStats(
+  appType?: string,
+  options?: UsageQueryOptions,
+) {
+  const effectiveAppType = appType === "all" ? undefined : appType;
   return useQuery({
-    queryKey: usageKeys.providerStats(),
-    queryFn: usageApi.getProviderStats,
-    refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS, // 每30秒自动刷新
+    queryKey: usageKeys.providerStats(appType),
+    queryFn: () => usageApi.getProviderStats(effectiveAppType),
+    refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS,
     refetchIntervalInBackground: options?.refetchIntervalInBackground ?? false,
   });
 }
 
-export function useModelStats(options?: UsageQueryOptions) {
+export function useModelStats(appType?: string, options?: UsageQueryOptions) {
+  const effectiveAppType = appType === "all" ? undefined : appType;
   return useQuery({
-    queryKey: usageKeys.modelStats(),
-    queryFn: usageApi.getModelStats,
-    refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS, // 每30秒自动刷新
+    queryKey: usageKeys.modelStats(appType),
+    queryFn: () => usageApi.getModelStats(effectiveAppType),
+    refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS,
     refetchIntervalInBackground: options?.refetchIntervalInBackground ?? false,
   });
 }

@@ -25,10 +25,7 @@ import {
 } from "@/components/ui/accordion";
 import { PricingConfigPanel } from "@/components/usage/PricingConfigPanel";
 import { UsageTimeRangePicker } from "./UsageTimeRangePicker";
-import {
-  getUsageTimeRangeValue,
-  type UsageTimeRangeValue,
-} from "./timeRange";
+import { getUsageTimeRangeValue, type UsageTimeRangeValue } from "./timeRange";
 
 export function UsageDashboard() {
   const { t } = useTranslation();
@@ -79,9 +76,15 @@ export function UsageDashboard() {
         </div>
       </div>
 
-      <UsageSummaryCards range={timeRange} refreshIntervalMs={refreshIntervalMs} />
+      <UsageSummaryCards
+        range={timeRange}
+        refreshIntervalMs={refreshIntervalMs}
+      />
 
-      <UsageTrendChart range={timeRange} refreshIntervalMs={refreshIntervalMs} />
+      <UsageTrendChart
+        range={timeRange}
+        refreshIntervalMs={refreshIntervalMs}
+      />
 
       <div className="space-y-4">
         <Tabs defaultValue="logs" className="w-full">

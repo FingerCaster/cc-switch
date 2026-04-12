@@ -291,8 +291,9 @@ mod tests {
 
     #[test]
     fn extracts_gemini_model_from_stream_endpoint_with_query() {
-        let model =
-            extract_model_from_endpoint("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse");
+        let model = extract_model_from_endpoint(
+            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+        );
 
         assert_eq!(model.as_deref(), Some("gemini-2.5-pro"));
     }

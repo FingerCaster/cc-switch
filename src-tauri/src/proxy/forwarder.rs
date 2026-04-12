@@ -21,12 +21,13 @@ use super::{
     usage::{logger::UsageLogger, parser::TokenUsage},
     ProxyError,
 };
+use crate::commands::{CodexOAuthState, CopilotAuthState};
+use crate::proxy::extract_session_id;
+use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
+use crate::proxy::providers::copilot_auth::CopilotAuthManager;
+use crate::{app_config::AppType, provider::Provider};
 use bytes::Bytes;
 use futures::StreamExt;
-use crate::commands::CopilotAuthState;
-use crate::proxy::providers::copilot_auth::CopilotAuthManager;
-use crate::proxy::extract_session_id;
-use crate::{app_config::AppType, provider::Provider};
 use http::Extensions;
 use serde_json::Value;
 use std::sync::Arc;
@@ -99,7 +100,10 @@ pub struct RequestForwarder {
 
 enum SemanticValidationOutcome {
     Success(ProxyResponse),
-    ToleratedAnomaly { response: ProxyResponse, note: String },
+    ToleratedAnomaly {
+        response: ProxyResponse,
+        note: String,
+    },
 }
 
 impl RequestForwarder {
@@ -344,11 +348,7 @@ impl RequestForwarder {
                     claude_api_format,
                 )) => {
                     self.router
-                        .release_permit_neutral(
-                            &provider.id,
-                            app_type_str,
-                            used_half_open_permit,
-                        )
+                        .release_permit_neutral(&provider.id, app_type_str, used_half_open_permit)
                         .await;
 
                     {
@@ -1076,6 +1076,9 @@ impl RequestForwarder {
         let force_identity_encoding = needs_transform
             || should_force_identity_encoding(&effective_endpoint, &filtered_body, headers);
 
+        // Codex OAuth 需要注入的 ChatGPT-Account-Id（在动态 token 获取期间填充）
+        let mut codex_oauth_account_id: Option<String> = None;
+
         // 获取认证头（提前准备，用于内联替换）
         let mut auth_headers = if let Some(mut auth) = adapter.extract_auth(provider) {
             // GitHub Copilot 特殊处理：从 CopilotAuthManager 获取真实 token
@@ -1128,10 +1131,70 @@ impl RequestForwarder {
                     ));
                 }
             }
+
+            // Codex OAuth 特殊处理：从 CodexOAuthManager 获取真实 access_token
+            if auth.strategy == AuthStrategy::CodexOAuth {
+                if let Some(app_handle) = &self.app_handle {
+                    let codex_state = app_handle.state::<CodexOAuthState>();
+                    let codex_auth: tokio::sync::RwLockReadGuard<'_, CodexOAuthManager> =
+                        codex_state.0.read().await;
+
+                    // 从 provider.meta 获取关联的 ChatGPT 账号 ID
+                    let account_id = provider
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.managed_account_id_for("codex_oauth"));
+
+                    let token_result = match &account_id {
+                        Some(id) => {
+                            log::debug!("[CodexOAuth] 使用指定账号 {id} 获取 token");
+                            codex_auth.get_valid_token_for_account(id).await
+                        }
+                        None => {
+                            log::debug!("[CodexOAuth] 使用默认账号获取 token");
+                            codex_auth.get_valid_token().await
+                        }
+                    };
+
+                    match token_result {
+                        Ok(token) => {
+                            auth = AuthInfo::new(token, AuthStrategy::CodexOAuth);
+                            // 解析使用的 account_id（用于注入 ChatGPT-Account-Id header）
+                            codex_oauth_account_id = match account_id {
+                                Some(id) => Some(id),
+                                None => codex_auth.default_account_id().await,
+                            };
+                            log::debug!(
+                                "[CodexOAuth] 成功获取 access_token (account={})",
+                                codex_oauth_account_id.as_deref().unwrap_or("default")
+                            );
+                        }
+                        Err(e) => {
+                            log::error!("[CodexOAuth] 获取 access_token 失败: {e}");
+                            return Err(ProxyError::AuthError(format!(
+                                "Codex OAuth 认证失败: {e}"
+                            )));
+                        }
+                    }
+                } else {
+                    log::error!("[CodexOAuth] AppHandle 不可用");
+                    return Err(ProxyError::AuthError(
+                        "Codex OAuth 认证不可用（无 AppHandle）".to_string(),
+                    ));
+                }
+            }
+
             adapter.get_auth_headers(&auth)
         } else {
             Vec::new()
         };
+
+        // 注入 Codex OAuth 的 ChatGPT-Account-Id header（如果有 account_id）
+        if let Some(ref account_id) = codex_oauth_account_id {
+            if let Ok(hv) = http::HeaderValue::from_str(account_id) {
+                auth_headers.push((http::HeaderName::from_static("chatgpt-account-id"), hv));
+            }
+        }
 
         // --- Copilot 优化器：动态 header 注入 ---
         if let Some((ref classification, ref det_request_id)) = copilot_optimization {
@@ -1464,12 +1527,12 @@ impl RequestForwarder {
             self.router
                 .reset_semantic_failure_streak(provider_id, app_type_str)
                 .await;
-            return Ok(SemanticValidationOutcome::Success(
-                response.with_timing(ResponseTiming {
+            return Ok(SemanticValidationOutcome::Success(response.with_timing(
+                ResponseTiming {
                     upstream_started_at: Some(attempt_started_at),
                     ..ResponseTiming::default()
-                }),
-            ));
+                },
+            )));
         }
 
         if response.is_sse() {
@@ -1479,7 +1542,7 @@ impl RequestForwarder {
                 response,
                 attempt_started_at,
             )
-                .await
+            .await
         } else {
             self.validate_codex_non_streaming_response(
                 app_type_str,
@@ -1487,7 +1550,7 @@ impl RequestForwarder {
                 response,
                 attempt_started_at,
             )
-                .await
+            .await
         }
     }
 
@@ -1525,7 +1588,9 @@ impl RequestForwarder {
             let base_message = "上游返回 200，但响应缺少有效输出，usage 全 0 或缺失";
 
             if streak < CODEX_SEMANTIC_FAILURE_THRESHOLD {
-                let note = format!("语义异常（{streak}/{CODEX_SEMANTIC_FAILURE_THRESHOLD}）：{base_message}");
+                let note = format!(
+                    "语义异常（{streak}/{CODEX_SEMANTIC_FAILURE_THRESHOLD}）：{base_message}"
+                );
                 Ok(SemanticValidationOutcome::ToleratedAnomaly {
                     response: ProxyResponse::from_buffered(status, headers, body_bytes)
                         .with_timing(timing)
@@ -1615,9 +1680,7 @@ impl RequestForwarder {
                     }
                 }
                 Some(Err(e)) => {
-                    return Err(ProxyError::ForwardFailed(format!(
-                        "流式响应读取失败: {e}"
-                    )));
+                    return Err(ProxyError::ForwardFailed(format!("流式响应读取失败: {e}")));
                 }
                 None => break,
             }
@@ -1635,14 +1698,17 @@ impl RequestForwarder {
                     .await;
                 let elapsed_ms = attempt_started_at.elapsed().as_millis() as u64;
                 let first_token_ms = first_upstream_event_ms.unwrap_or(elapsed_ms);
-                let response =
-                    ProxyResponse::from_stream(status, headers, buffered_only_stream(buffered_chunks))
-                        .with_timing(ResponseTiming {
-                            upstream_started_at: Some(attempt_started_at),
-                            upstream_first_token_ms: Some(first_token_ms),
-                            upstream_first_token_known: true,
-                            upstream_duration_ms: Some(elapsed_ms),
-                        });
+                let response = ProxyResponse::from_stream(
+                    status,
+                    headers,
+                    buffered_only_stream(buffered_chunks),
+                )
+                .with_timing(ResponseTiming {
+                    upstream_started_at: Some(attempt_started_at),
+                    upstream_first_token_ms: Some(first_token_ms),
+                    upstream_first_token_known: true,
+                    upstream_duration_ms: Some(elapsed_ms),
+                });
                 return Ok(SemanticValidationOutcome::Success(response));
             }
         }
@@ -1654,7 +1720,8 @@ impl RequestForwarder {
         let base_message = "上游流式响应未产出有效内容，usage 全 0 或缺失";
 
         if streak < CODEX_SEMANTIC_FAILURE_THRESHOLD {
-            let note = format!("语义异常（{streak}/{CODEX_SEMANTIC_FAILURE_THRESHOLD}）：{base_message}");
+            let note =
+                format!("语义异常（{streak}/{CODEX_SEMANTIC_FAILURE_THRESHOLD}）：{base_message}");
             let elapsed_ms = attempt_started_at.elapsed().as_millis() as u64;
             let response =
                 ProxyResponse::from_stream(status, headers, buffered_only_stream(buffered_chunks))
@@ -1876,7 +1943,11 @@ fn is_meaningful_codex_non_streaming_body(body: &Value) -> bool {
         return true;
     }
 
-    if body.get("usage").map(has_non_zero_usage_value).unwrap_or(false) {
+    if body
+        .get("usage")
+        .map(has_non_zero_usage_value)
+        .unwrap_or(false)
+    {
         return true;
     }
 
@@ -1999,14 +2070,18 @@ fn has_non_zero_usage_value(usage: &Value) -> bool {
         "total_tokens",
     ];
 
-    if keys
-        .iter()
-        .any(|key| usage.get(*key).and_then(|value| value.as_u64()).unwrap_or(0) > 0)
-    {
+    if keys.iter().any(|key| {
+        usage
+            .get(*key)
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+            > 0
+    }) {
         return true;
     }
 
-    usage.get("input_tokens_details")
+    usage
+        .get("input_tokens_details")
         .and_then(|value| value.get("cached_tokens"))
         .and_then(|value| value.as_u64())
         .unwrap_or(0)
@@ -2261,12 +2336,12 @@ fn summarize_text_for_log(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AppError;
     use crate::database::Database;
     use crate::proxy::circuit_breaker::CircuitBreakerConfig;
     use crate::proxy::failover_switch::FailoverSwitchManager;
     use crate::proxy::provider_router::ProviderRouter;
     use crate::proxy::types::ProxyStatus;
+    use crate::AppError;
     use axum::body::Body;
     use axum::http::header::{HeaderValue, ACCEPT};
     use axum::http::HeaderMap;
@@ -2341,9 +2416,10 @@ mod tests {
             post(move || {
                 let chunks = chunks.clone();
                 async move {
-                    let stream = futures::stream::iter(chunks.into_iter().map(|chunk| {
-                        Ok::<Bytes, std::io::Error>(Bytes::from(chunk.to_string()))
-                    }));
+                    let stream =
+                        futures::stream::iter(chunks.into_iter().map(|chunk| {
+                            Ok::<Bytes, std::io::Error>(Bytes::from(chunk.to_string()))
+                        }));
 
                     Response::builder()
                         .status(axum::http::StatusCode::from_u16(status).expect("valid status"))
@@ -2397,7 +2473,9 @@ mod tests {
             .expect("bind test listener");
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve delayed sse app");
+            axum::serve(listener, app)
+                .await
+                .expect("serve delayed sse app");
         });
         format!("http://{}", addr)
     }
@@ -2668,7 +2746,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retryable_failover_attempts_should_be_persisted_to_request_logs() -> Result<(), AppError> {
+    async fn retryable_failover_attempts_should_be_persisted_to_request_logs(
+    ) -> Result<(), AppError> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let db = Arc::new(Database::memory()?);
         let router = Arc::new(ProviderRouter::new(db.clone()));
@@ -2762,7 +2841,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retryable_failover_attempt_logs_should_keep_codex_session_id() -> Result<(), AppError> {
+    async fn retryable_failover_attempt_logs_should_keep_codex_session_id() -> Result<(), AppError>
+    {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let db = Arc::new(Database::memory()?);
         let router = Arc::new(ProviderRouter::new(db.clone()));
@@ -2846,7 +2926,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_failover_attempt_logs_should_extract_model_from_endpoint() -> Result<(), AppError> {
+    async fn gemini_failover_attempt_logs_should_extract_model_from_endpoint(
+    ) -> Result<(), AppError> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let db = Arc::new(Database::memory()?);
         let router = Arc::new(ProviderRouter::new(db.clone()));
@@ -2918,7 +2999,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_non_streaming_semantic_empty_response_should_failover_on_third_hit() -> Result<(), AppError> {
+    async fn codex_non_streaming_semantic_empty_response_should_failover_on_third_hit(
+    ) -> Result<(), AppError> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let db = Arc::new(Database::memory()?);
         db.update_circuit_breaker_config(&CircuitBreakerConfig {
@@ -3007,7 +3089,12 @@ mod tests {
                     providers.clone(),
                 )
                 .await
-                .map_err(|e| AppError::Message(format!("semantic anomaly should be tolerated before threshold: {}", e.error)))?;
+                .map_err(|e| {
+                    AppError::Message(format!(
+                        "semantic anomaly should be tolerated before threshold: {}",
+                        e.error
+                    ))
+                })?;
 
             assert_eq!(result.provider.id, "provider-a");
             let semantic_note = result
@@ -3052,7 +3139,12 @@ mod tests {
                 providers,
             )
             .await
-            .map_err(|e| AppError::Message(format!("third semantic anomaly should failover: {}", e.error)))?;
+            .map_err(|e| {
+                AppError::Message(format!(
+                    "third semantic anomaly should failover: {}",
+                    e.error
+                ))
+            })?;
 
         assert_eq!(result.provider.id, "provider-b");
 
@@ -3061,8 +3153,8 @@ mod tests {
             .bytes()
             .await
             .map_err(|e| AppError::Message(e.to_string()))?;
-        let body_json: Value = serde_json::from_slice(&body_bytes)
-            .map_err(|e| AppError::Message(e.to_string()))?;
+        let body_json: Value =
+            serde_json::from_slice(&body_bytes).map_err(|e| AppError::Message(e.to_string()))?;
         assert_eq!(body_json["id"], "resp_ok");
 
         let conn = crate::database::lock_conn!(db.conn);
@@ -3095,7 +3187,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_streaming_semantic_empty_response_should_failover_on_third_hit() -> Result<(), AppError> {
+    async fn codex_streaming_semantic_empty_response_should_failover_on_third_hit(
+    ) -> Result<(), AppError> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let db = Arc::new(Database::memory()?);
         db.update_circuit_breaker_config(&CircuitBreakerConfig {
@@ -3171,10 +3264,18 @@ mod tests {
                     providers.clone(),
                 )
                 .await
-                .map_err(|e| AppError::Message(format!("semantic stream anomaly should be tolerated before threshold: {}", e.error)))?;
+                .map_err(|e| {
+                    AppError::Message(format!(
+                        "semantic stream anomaly should be tolerated before threshold: {}",
+                        e.error
+                    ))
+                })?;
 
             assert_eq!(result.provider.id, "provider-a");
-            assert!(result.response.is_sse(), "should keep streaming response semantics");
+            assert!(
+                result.response.is_sse(),
+                "should keep streaming response semantics"
+            );
             let semantic_note = result
                 .response
                 .semantic_note()
@@ -3220,10 +3321,18 @@ mod tests {
                 providers,
             )
             .await
-            .map_err(|e| AppError::Message(format!("third semantic stream anomaly should failover: {}", e.error)))?;
+            .map_err(|e| {
+                AppError::Message(format!(
+                    "third semantic stream anomaly should failover: {}",
+                    e.error
+                ))
+            })?;
 
         assert_eq!(result.provider.id, "provider-b");
-        assert!(result.response.is_sse(), "should keep streaming response semantics");
+        assert!(
+            result.response.is_sse(),
+            "should keep streaming response semantics"
+        );
 
         let sse_text = String::from_utf8(
             result
@@ -3267,8 +3376,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_streaming_semantic_success_should_capture_upstream_first_token_timing()
-    -> Result<(), AppError> {
+    async fn codex_streaming_semantic_success_should_capture_upstream_first_token_timing(
+    ) -> Result<(), AppError> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let db = Arc::new(Database::memory()?);
         let router = Arc::new(ProviderRouter::new(db.clone()));
@@ -3334,7 +3443,12 @@ mod tests {
                 vec![build_test_provider("provider-a", "Provider A", &base_url)],
             )
             .await
-            .map_err(|e| AppError::Message(format!("codex semantic success should not fail: {}", e.error)))?;
+            .map_err(|e| {
+                AppError::Message(format!(
+                    "codex semantic success should not fail: {}",
+                    e.error
+                ))
+            })?;
 
         let timing = result
             .response
@@ -3367,8 +3481,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_streaming_first_upstream_event_should_count_as_first_token_timing()
-    -> Result<(), AppError> {
+    async fn codex_streaming_first_upstream_event_should_count_as_first_token_timing(
+    ) -> Result<(), AppError> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let db = Arc::new(Database::memory()?);
         let router = Arc::new(ProviderRouter::new(db.clone()));

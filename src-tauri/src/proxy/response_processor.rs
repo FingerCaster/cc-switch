@@ -248,7 +248,9 @@ pub async fn handle_non_streaming(
                 &ctx.request_model,
                 resolve_duration_ms(
                     response_timing,
-                    response_timing.upstream_started_at.unwrap_or(ctx.start_time),
+                    response_timing
+                        .upstream_started_at
+                        .unwrap_or(ctx.start_time),
                     ctx.latency_ms(),
                 ),
                 status.as_u16(),
@@ -269,7 +271,9 @@ pub async fn handle_non_streaming(
                 &ctx.request_model,
                 resolve_duration_ms(
                     response_timing,
-                    response_timing.upstream_started_at.unwrap_or(ctx.start_time),
+                    response_timing
+                        .upstream_started_at
+                        .unwrap_or(ctx.start_time),
                     ctx.latency_ms(),
                 ),
                 status.as_u16(),
@@ -295,7 +299,9 @@ pub async fn handle_non_streaming(
             &ctx.request_model,
             resolve_duration_ms(
                 response_timing,
-                response_timing.upstream_started_at.unwrap_or(ctx.start_time),
+                response_timing
+                    .upstream_started_at
+                    .unwrap_or(ctx.start_time),
                 ctx.latency_ms(),
             ),
             status.as_u16(),
@@ -690,6 +696,7 @@ pub fn create_logged_passthrough_stream(
     async_stream::stream! {
         let mut buffer = String::new();
         let mut collector_guard = CollectorFinishGuard::new(usage_collector);
+        let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut is_first_chunk = true;
 
         // 超时配置
@@ -740,8 +747,7 @@ pub fn create_logged_passthrough_stream(
                         );
                     }
                     is_first_chunk = false;
-                    let text = String::from_utf8_lossy(&bytes);
-                    buffer.push_str(&text);
+                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
 
                     // 尝试解析并记录完整的 SSE 事件
                     while let Some(pos) = buffer.find("\n\n") {
@@ -805,16 +811,16 @@ mod tests {
     use crate::database::Database;
     use crate::error::AppError;
     use crate::provider::ProviderMeta;
+    use crate::proxy::failover_switch::FailoverSwitchManager;
     use crate::proxy::handler_config::CODEX_PARSER_CONFIG;
     use crate::proxy::handler_context::RequestContext;
-    use crate::proxy::failover_switch::FailoverSwitchManager;
     use crate::proxy::hyper_client::ResponseTiming;
     use crate::proxy::provider_router::ProviderRouter;
     use crate::proxy::types::{ProxyConfig, ProxyStatus};
     use axum::http::header::CONTENT_TYPE;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
-    use serde_json::json;
     use rust_decimal::Decimal;
+    use serde_json::json;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1053,8 +1059,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_response_prefers_upstream_timing_metadata_for_stream_logs()
-    -> Result<(), AppError> {
+    async fn test_process_response_prefers_upstream_timing_metadata_for_stream_logs(
+    ) -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
         seed_pricing(&db)?;
         insert_provider(&db, "provider-timing", "codex", ProviderMeta::default())?;

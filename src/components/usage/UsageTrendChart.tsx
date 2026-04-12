@@ -111,8 +111,8 @@ export function UsageTrendChart({
           {range.preset === "allTime"
             ? t("usage.range.allTime", "全部用量")
             : range.preset === "today"
-            ? t("usage.range.todayWithUnit", "今天（按小时）")
-            : t("usage.range.selected", "所选时间范围")}
+              ? t("usage.range.todayWithUnit", "今天（按小时）")
+              : t("usage.range.selected", "所选时间范围")}
         </p>
       </div>
 

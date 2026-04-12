@@ -108,11 +108,7 @@ pub enum ProxyResponse {
 }
 
 impl ProxyResponse {
-    pub fn from_buffered(
-        status: http::StatusCode,
-        headers: http::HeaderMap,
-        body: Bytes,
-    ) -> Self {
+    pub fn from_buffered(status: http::StatusCode, headers: http::HeaderMap, body: Bytes) -> Self {
         Self::Buffered {
             status,
             headers,
@@ -306,9 +302,7 @@ impl ProxyResponse {
                     .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
                 Box::pin(stream)
             }
-            Self::Buffered { body, .. } => {
-                Box::pin(futures::stream::once(async move { Ok(body) }))
-            }
+            Self::Buffered { body, .. } => Box::pin(futures::stream::once(async move { Ok(body) })),
             Self::Stream { stream, .. } => stream,
         }
     }
