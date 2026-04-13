@@ -106,10 +106,13 @@ export interface LogFilters {
   appType?: string;
   providerName?: string;
   model?: string;
+  sourceGroup?: RequestLogSourceGroup;
   statusCode?: number;
   startDate?: number;
   endDate?: number;
 }
+
+export type RequestLogSourceGroup = "all" | "proxy" | "session";
 
 export interface ProviderLimitStatus {
   providerId: string;

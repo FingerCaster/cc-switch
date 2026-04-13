@@ -1082,6 +1082,11 @@
       "gemini": "Gemini"
     },
     "dataSources": "数据来源",
+    "sourceGroup": {
+      "all": "全部",
+      "proxy": "代理",
+      "session": "会话日志"
+    },
     "dataSource": {
       "proxy": "代理",
       "session_log": "会话日志",

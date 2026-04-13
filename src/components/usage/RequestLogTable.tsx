@@ -19,7 +19,7 @@ import {
 } from "@/components/ui/select";
 import { useRequestLogs, usageKeys } from "@/lib/query/usage";
 import { useQueryClient } from "@tanstack/react-query";
-import type { LogFilters } from "@/types/usage";
+import type { LogFilters, RequestLogSourceGroup } from "@/types/usage";
 import { ChevronLeft, ChevronRight, RefreshCw, Search, X } from "lucide-react";
 import {
   fmtInt,
@@ -29,6 +29,16 @@ import {
 } from "./format";
 import { UsageTimeRangePicker } from "./UsageTimeRangePicker";
 import { getUsageTimeRangeValue, type UsageTimeRangeValue } from "./timeRange";
+
+const DEFAULT_REQUEST_LOG_FILTERS: LogFilters = {
+  sourceGroup: "proxy",
+};
+
+const REQUEST_LOG_SOURCE_GROUP_OPTIONS: RequestLogSourceGroup[] = [
+  "all",
+  "proxy",
+  "session",
+];
 
 interface RequestLogTableProps {
   appType?: string;
@@ -50,8 +60,12 @@ export function RequestLogTable({
   const [appliedRange, setAppliedRange] = useState<UsageTimeRangeValue>(() =>
     getUsageTimeRangeValue("today"),
   );
-  const [appliedFilters, setAppliedFilters] = useState<LogFilters>({});
-  const [draftFilters, setDraftFilters] = useState<LogFilters>({});
+  const [appliedFilters, setAppliedFilters] = useState<LogFilters>(() => ({
+    ...DEFAULT_REQUEST_LOG_FILTERS,
+  }));
+  const [draftFilters, setDraftFilters] = useState<LogFilters>(() => ({
+    ...DEFAULT_REQUEST_LOG_FILTERS,
+  }));
   const [page, setPage] = useState(0);
   const pageSize = 20;
 
@@ -85,8 +99,8 @@ export function RequestLogTable({
     const todayRange = getUsageTimeRangeValue("today");
     setSelectedRange(todayRange);
     setAppliedRange(todayRange);
-    setDraftFilters({});
-    setAppliedFilters({});
+    setDraftFilters({ ...DEFAULT_REQUEST_LOG_FILTERS });
+    setAppliedFilters({ ...DEFAULT_REQUEST_LOG_FILTERS });
     setPage(0);
   };
 
@@ -162,6 +176,30 @@ export function RequestLogTable({
               <SelectItem value="401">401 Unauthorized</SelectItem>
               <SelectItem value="429">429 Rate Limit</SelectItem>
               <SelectItem value="500">500 Server Error</SelectItem>
+            </SelectContent>
+          </Select>
+
+          <Select
+            value={draftFilters.sourceGroup || "all"}
+            onValueChange={(v) =>
+              setDraftFilters({
+                ...draftFilters,
+                sourceGroup:
+                  v === "all" ? undefined : (v as RequestLogSourceGroup),
+              })
+            }
+          >
+            <SelectTrigger className="w-[150px] bg-background">
+              <SelectValue placeholder={t("usage.source")} />
+            </SelectTrigger>
+            <SelectContent>
+              {REQUEST_LOG_SOURCE_GROUP_OPTIONS.map((sourceGroup) => (
+                <SelectItem key={sourceGroup} value={sourceGroup}>
+                  {t(`usage.sourceGroup.${sourceGroup}`, {
+                    defaultValue: sourceGroup,
+                  })}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
 

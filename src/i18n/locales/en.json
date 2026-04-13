@@ -1081,6 +1081,11 @@
       "gemini": "Gemini"
     },
     "dataSources": "Data Sources",
+    "sourceGroup": {
+      "all": "All",
+      "proxy": "Proxy",
+      "session": "Session Log"
+    },
     "dataSource": {
       "proxy": "Proxy",
       "session_log": "Session Log",

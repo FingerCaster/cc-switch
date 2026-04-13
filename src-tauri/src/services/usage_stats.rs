@@ -69,6 +69,7 @@ pub struct LogFilters {
     pub app_type: Option<String>,
     pub provider_name: Option<String>,
     pub model: Option<String>,
+    pub source_group: Option<String>,
     pub status_code: Option<u16>,
     pub start_date: Option<i64>,
     pub end_date: Option<i64>,
@@ -130,7 +131,270 @@ fn provider_name_coalesce(log_alias: &str, provider_alias: &str) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestLogSourceKind {
+    Proxy,
+    Session,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestLogSourceMeta {
+    kind: RequestLogSourceKind,
+    apps: &'static [&'static str],
+}
+
+const REQUEST_LOG_SOURCE_META_PROXY: RequestLogSourceMeta = RequestLogSourceMeta {
+    kind: RequestLogSourceKind::Proxy,
+    apps: &[],
+};
+
+const REQUEST_LOG_SOURCE_META_OTHER: RequestLogSourceMeta = RequestLogSourceMeta {
+    kind: RequestLogSourceKind::Other,
+    apps: &[],
+};
+
+const REQUEST_LOG_SOURCE_REGISTRY: &[(&str, RequestLogSourceMeta)] = &[
+    (
+        "session_log",
+        RequestLogSourceMeta {
+            kind: RequestLogSourceKind::Session,
+            apps: &["claude"],
+        },
+    ),
+    (
+        "codex_session",
+        RequestLogSourceMeta {
+            kind: RequestLogSourceKind::Session,
+            apps: &["codex"],
+        },
+    ),
+    (
+        "gemini_session",
+        RequestLogSourceMeta {
+            kind: RequestLogSourceKind::Session,
+            apps: &["gemini"],
+        },
+    ),
+    (
+        "codex_db",
+        RequestLogSourceMeta {
+            kind: RequestLogSourceKind::Other,
+            apps: &["codex"],
+        },
+    ),
+];
+
+fn classify_request_log_source(data_source: Option<&str>) -> RequestLogSourceMeta {
+    match data_source {
+        None | Some("") | Some("proxy") => REQUEST_LOG_SOURCE_META_PROXY,
+        Some(source) => REQUEST_LOG_SOURCE_REGISTRY
+            .iter()
+            .find_map(|(registered_source, meta)| {
+                if *registered_source == source {
+                    Some(*meta)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(REQUEST_LOG_SOURCE_META_OTHER),
+    }
+}
+
+fn normalized_app_type_filter(app_type: Option<&str>) -> Option<&str> {
+    app_type.filter(|app| !app.is_empty() && *app != "all")
+}
+
+fn matches_source_app(meta: &RequestLogSourceMeta, app_type: Option<&str>) -> bool {
+    match normalized_app_type_filter(app_type) {
+        Some(app) => meta.apps.is_empty() || meta.apps.contains(&app),
+        None => true,
+    }
+}
+
+fn request_log_source_values(
+    kind: RequestLogSourceKind,
+    app_type: Option<&str>,
+) -> Vec<&'static str> {
+    REQUEST_LOG_SOURCE_REGISTRY
+        .iter()
+        .filter_map(|(source, _)| {
+            let meta = classify_request_log_source(Some(source));
+            if meta.kind == kind && matches_source_app(&meta, app_type) {
+                Some(*source)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn sql_quote_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn request_log_source_group_predicate(
+    alias: &str,
+    source_group: Option<&str>,
+    app_type: Option<&str>,
+) -> Option<String> {
+    let prefix = if alias.is_empty() {
+        String::new()
+    } else {
+        format!("{alias}.")
+    };
+    let data_source_expr = format!("COALESCE({prefix}data_source, 'proxy')");
+
+    match source_group.filter(|group| !group.is_empty() && *group != "all") {
+        Some("proxy") => match classify_request_log_source(Some("proxy")).kind {
+            RequestLogSourceKind::Proxy => Some(format!("{data_source_expr} = 'proxy'")),
+            RequestLogSourceKind::Session | RequestLogSourceKind::Other => {
+                Some("1 = 0".to_string())
+            }
+        },
+        Some("session") => {
+            let sources = request_log_source_values(RequestLogSourceKind::Session, app_type);
+            if sources.is_empty() {
+                Some("1 = 0".to_string())
+            } else {
+                let values = sources
+                    .iter()
+                    .map(|source| sql_quote_string(source))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(format!("{data_source_expr} IN ({values})"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn proxy_detail_scope_predicate(alias: &str) -> String {
+    let prefix = if alias.is_empty() {
+        String::new()
+    } else {
+        format!("{alias}.")
+    };
+    format!(
+        "COALESCE({prefix}data_source, 'proxy') = 'proxy' \
+         AND {prefix}provider_id NOT IN ('_session', '_codex_session', '_gemini_session')"
+    )
+}
+
+fn proxy_rollup_scope_predicate(alias: &str) -> String {
+    let prefix = if alias.is_empty() {
+        String::new()
+    } else {
+        format!("{alias}.")
+    };
+    format!("{prefix}provider_id NOT IN ('_session', '_codex_session', '_gemini_session')")
+}
+
 impl Database {
+    fn backfill_missing_proxy_costs(
+        conn: &Connection,
+        app_type: Option<&str>,
+        start_date: Option<i64>,
+        end_date: Option<i64>,
+        provider_id: Option<&str>,
+    ) -> Result<u64, AppError> {
+        let mut conditions = vec![proxy_detail_scope_predicate("")];
+        conditions.push("CAST(COALESCE(NULLIF(total_cost_usd, ''), '0') AS REAL) = 0".to_string());
+        conditions.push(
+            "(input_tokens > 0 OR output_tokens > 0 OR cache_read_tokens > 0 OR cache_creation_tokens > 0)"
+                .to_string(),
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(at) = app_type {
+            conditions.push("app_type = ?".to_string());
+            params.push(Box::new(at.to_string()));
+        }
+        if let Some(start) = start_date {
+            conditions.push("created_at >= ?".to_string());
+            params.push(Box::new(start));
+        }
+        if let Some(end) = end_date {
+            conditions.push("created_at <= ?".to_string());
+            params.push(Box::new(end));
+        }
+        if let Some(pid) = provider_id {
+            conditions.push("provider_id = ?".to_string());
+            params.push(Box::new(pid.to_string()));
+        }
+
+        let where_clause = format!("WHERE {}", conditions.join(" AND "));
+        let sql = format!(
+            "SELECT request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    total_cost_usd, cost_multiplier, created_at
+             FROM proxy_request_logs
+             {where_clause}"
+        );
+
+        let logs = {
+            let mut stmt = conn.prepare(&sql)?;
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(params_refs.as_slice(), |row| {
+                Ok(RequestLogDetail {
+                    request_id: row.get(0)?,
+                    provider_id: row.get(1)?,
+                    provider_name: None,
+                    app_type: row.get(2)?,
+                    model: row.get(3)?,
+                    request_model: row.get(4)?,
+                    cost_multiplier: row
+                        .get::<_, Option<String>>(10)?
+                        .unwrap_or_else(|| "1".to_string()),
+                    input_tokens: row.get::<_, i64>(5)? as u32,
+                    output_tokens: row.get::<_, i64>(6)? as u32,
+                    cache_read_tokens: row.get::<_, i64>(7)? as u32,
+                    cache_creation_tokens: row.get::<_, i64>(8)? as u32,
+                    input_cost_usd: "0".to_string(),
+                    output_cost_usd: "0".to_string(),
+                    cache_read_cost_usd: "0".to_string(),
+                    cache_creation_cost_usd: "0".to_string(),
+                    total_cost_usd: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    is_streaming: false,
+                    latency_ms: 0,
+                    first_token_ms: None,
+                    duration_ms: None,
+                    status_code: 200,
+                    error_message: None,
+                    created_at: row.get(11)?,
+                    data_source: Some("proxy".to_string()),
+                })
+            })?;
+
+            let mut logs = Vec::new();
+            for row in rows {
+                logs.push(row?);
+            }
+            logs
+        };
+
+        let mut provider_cache = HashMap::new();
+        let mut pricing_cache = HashMap::new();
+        let mut updated = 0u64;
+
+        for mut log in logs {
+            let original_cost = log.total_cost_usd.clone();
+            Self::maybe_backfill_log_costs(
+                conn,
+                &mut log,
+                &mut provider_cache,
+                &mut pricing_cache,
+            )?;
+            if log.total_cost_usd != original_cost {
+                updated += 1;
+            }
+        }
+
+        Ok(updated)
+    }
+
     /// 获取使用量汇总
     pub fn get_usage_summary(
         &self,
@@ -139,21 +403,22 @@ impl Database {
         app_type: Option<&str>,
     ) -> Result<UsageSummary, AppError> {
         let conn = lock_conn!(self.conn);
+        let _ = Self::backfill_missing_proxy_costs(&conn, app_type, start_date, end_date, None)?;
 
         // Build detail WHERE clause
-        let mut conditions = Vec::new();
+        let mut conditions = vec![proxy_detail_scope_predicate("")];
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(start) = start_date {
-            conditions.push("created_at >= ?");
+            conditions.push("created_at >= ?".to_string());
             params_vec.push(Box::new(start));
         }
         if let Some(end) = end_date {
-            conditions.push("created_at <= ?");
+            conditions.push("created_at <= ?".to_string());
             params_vec.push(Box::new(end));
         }
         if let Some(at) = app_type {
-            conditions.push("app_type = ?");
+            conditions.push("app_type = ?".to_string());
             params_vec.push(Box::new(at.to_string()));
         }
 
@@ -164,7 +429,7 @@ impl Database {
         };
 
         // Build rollup WHERE clause using date strings
-        let mut rollup_conditions: Vec<String> = Vec::new();
+        let mut rollup_conditions: Vec<String> = vec![proxy_rollup_scope_predicate("")];
         let mut rollup_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(start) = start_date {
@@ -258,6 +523,7 @@ impl Database {
         app_type: Option<&str>,
     ) -> Result<Vec<DailyStats>, AppError> {
         let conn = lock_conn!(self.conn);
+        let _ = Self::backfill_missing_proxy_costs(&conn, app_type, start_date, end_date, None)?;
 
         let end_ts = end_date.unwrap_or_else(|| Local::now().timestamp());
         let mut start_ts = start_date.unwrap_or_else(|| end_ts - 24 * 60 * 60);
@@ -292,6 +558,7 @@ impl Database {
         } else {
             ""
         };
+        let detail_scope_filter = proxy_detail_scope_predicate("");
 
         // Query detail logs
         let sql = format!(
@@ -300,12 +567,12 @@ impl Database {
                 COUNT(*) as request_count,
                 COALESCE(SUM(CAST(total_cost_usd AS REAL)), 0) as total_cost,
                 COALESCE(SUM(input_tokens + output_tokens), 0) as total_tokens,
-                COALESCE(SUM(input_tokens), 0) as total_input_tokens,
-                COALESCE(SUM(output_tokens), 0) as total_output_tokens,
-                COALESCE(SUM(cache_creation_tokens), 0) as total_cache_creation_tokens,
-                COALESCE(SUM(cache_read_tokens), 0) as total_cache_read_tokens
+                    COALESCE(SUM(input_tokens), 0) as total_input_tokens,
+                    COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+                    COALESCE(SUM(cache_creation_tokens), 0) as total_cache_creation_tokens,
+                    COALESCE(SUM(cache_read_tokens), 0) as total_cache_read_tokens
             FROM proxy_request_logs
-            WHERE created_at >= ?1 AND created_at <= ?2 {app_type_filter}
+            WHERE created_at >= ?1 AND created_at <= ?2 {app_type_filter} AND {detail_scope_filter}
             GROUP BY bucket_idx
             ORDER BY bucket_idx ASC"
         );
@@ -350,6 +617,7 @@ impl Database {
 
         // Also query rollup data (daily granularity, only useful for daily buckets)
         if bucket_seconds >= 86400 {
+            let rollup_scope_filter = proxy_rollup_scope_predicate("");
             let rollup_sql = format!(
                 "SELECT
                     CAST((CAST(strftime('%s', date) AS INTEGER) - ?1) / ?3 AS INTEGER) as bucket_idx,
@@ -361,7 +629,7 @@ impl Database {
                     COALESCE(SUM(cache_creation_tokens), 0),
                     COALESCE(SUM(cache_read_tokens), 0)
                 FROM usage_daily_rollups
-                WHERE date >= date(?1, 'unixepoch', 'localtime') AND date <= date(?2, 'unixepoch', 'localtime') {app_type_filter}
+                WHERE date >= date(?1, 'unixepoch', 'localtime') AND date <= date(?2, 'unixepoch', 'localtime') {app_type_filter} AND {rollup_scope_filter}
                 GROUP BY bucket_idx
                 ORDER BY bucket_idx ASC"
             );
@@ -456,6 +724,7 @@ impl Database {
         app_type: Option<&str>,
     ) -> Result<Vec<ProviderStats>, AppError> {
         let conn = lock_conn!(self.conn);
+        let _ = Self::backfill_missing_proxy_costs(&conn, app_type, None, None, None)?;
 
         let (detail_where, rollup_where) = if app_type.is_some() {
             ("WHERE l.app_type = ?1", "WHERE r.app_type = ?2")
@@ -543,6 +812,7 @@ impl Database {
     /// 获取模型统计
     pub fn get_model_stats(&self, app_type: Option<&str>) -> Result<Vec<ModelStats>, AppError> {
         let conn = lock_conn!(self.conn);
+        let _ = Self::backfill_missing_proxy_costs(&conn, app_type, None, None, None)?;
 
         let (detail_where, rollup_where) = if app_type.is_some() {
             ("WHERE app_type = ?1", "WHERE app_type = ?2")
@@ -620,31 +890,40 @@ impl Database {
     ) -> Result<PaginatedLogs, AppError> {
         let conn = lock_conn!(self.conn);
 
-        let mut conditions = Vec::new();
+        let provider_name_expr = provider_name_coalesce("l", "p");
+        let app_type_filter = normalized_app_type_filter(filters.app_type.as_deref());
+        let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
-        if let Some(ref app_type) = filters.app_type {
-            conditions.push("l.app_type = ?");
-            params.push(Box::new(app_type.clone()));
+        if let Some(app_type) = app_type_filter {
+            conditions.push("l.app_type = ?".to_string());
+            params.push(Box::new(app_type.to_string()));
         }
         if let Some(ref provider_name) = filters.provider_name {
-            conditions.push("p.name LIKE ?");
+            conditions.push(format!("{provider_name_expr} LIKE ?"));
             params.push(Box::new(format!("%{provider_name}%")));
         }
         if let Some(ref model) = filters.model {
-            conditions.push("l.model LIKE ?");
+            conditions.push("l.model LIKE ?".to_string());
             params.push(Box::new(format!("%{model}%")));
         }
+        if let Some(predicate) = request_log_source_group_predicate(
+            "l",
+            filters.source_group.as_deref(),
+            app_type_filter,
+        ) {
+            conditions.push(predicate);
+        }
         if let Some(status) = filters.status_code {
-            conditions.push("l.status_code = ?");
+            conditions.push("l.status_code = ?".to_string());
             params.push(Box::new(status as i64));
         }
         if let Some(start) = filters.start_date {
-            conditions.push("l.created_at >= ?");
+            conditions.push("l.created_at >= ?".to_string());
             params.push(Box::new(start));
         }
         if let Some(end) = filters.end_date {
-            conditions.push("l.created_at <= ?");
+            conditions.push("l.created_at <= ?".to_string());
             params.push(Box::new(end));
         }
 
@@ -670,9 +949,8 @@ impl Database {
         params.push(Box::new(page_size as i64));
         params.push(Box::new(offset as i64));
 
-        let logs_pname = provider_name_coalesce("l", "p");
         let sql = format!(
-            "SELECT l.request_id, l.provider_id, {logs_pname} as provider_name, l.app_type, l.model,
+            "SELECT l.request_id, l.provider_id, {provider_name_expr} as provider_name, l.app_type, l.model,
                     l.request_model, l.cost_multiplier,
                     l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens,
                     l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
@@ -815,6 +1093,13 @@ impl Database {
         app_type: &str,
     ) -> Result<ProviderLimitStatus, AppError> {
         let conn = lock_conn!(self.conn);
+        let _ = Self::backfill_missing_proxy_costs(
+            &conn,
+            Some(app_type),
+            None,
+            None,
+            Some(provider_id),
+        )?;
 
         // 获取 provider 的限额设置
         let (limit_daily, limit_monthly) = conn
@@ -938,7 +1223,7 @@ impl Database {
             return Ok(());
         }
 
-        let pricing = match Self::get_model_pricing_cached(conn, pricing_cache, &log.model)? {
+        let pricing = match Self::get_log_pricing_cached(conn, pricing_cache, log)? {
             Some(info) => info,
             None => return Ok(()),
         };
@@ -1060,6 +1345,24 @@ impl Database {
         cache.insert(model.to_string(), pricing.clone());
         Ok(Some(pricing))
     }
+
+    fn get_log_pricing_cached(
+        conn: &Connection,
+        cache: &mut HashMap<String, PricingInfo>,
+        log: &RequestLogDetail,
+    ) -> Result<Option<PricingInfo>, AppError> {
+        if let Some(info) = Self::get_model_pricing_cached(conn, cache, &log.model)? {
+            return Ok(Some(info));
+        }
+
+        if let Some(request_model) = log.request_model.as_deref() {
+            if request_model != log.model {
+                return Self::get_model_pricing_cached(conn, cache, request_model);
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 pub(crate) fn find_model_pricing_row(
@@ -1108,6 +1411,76 @@ pub(crate) fn find_model_pricing_row(
 mod tests {
     use super::*;
 
+    fn seed_request_log_for_group_test(
+        conn: &Connection,
+        request_id: &str,
+        provider_id: &str,
+        app_type: &str,
+        created_at: i64,
+        data_source: &str,
+    ) -> Result<(), AppError> {
+        conn.execute(
+            "INSERT INTO proxy_request_logs (
+                request_id, provider_id, app_type, model,
+                input_tokens, output_tokens, total_cost_usd,
+                latency_ms, status_code, created_at, data_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                request_id,
+                provider_id,
+                app_type,
+                "gpt-5",
+                10,
+                5,
+                "0.01",
+                100,
+                200,
+                created_at,
+                data_source
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn seed_request_log_source_group_fixture(db: &Database) -> Result<(), AppError> {
+        let conn = lock_conn!(db.conn);
+        seed_request_log_for_group_test(&conn, "proxy-log", "p1", "codex", 1000, "proxy")?;
+        seed_request_log_for_group_test(
+            &conn,
+            "claude-session-log",
+            "_session",
+            "claude",
+            1001,
+            "session_log",
+        )?;
+        seed_request_log_for_group_test(
+            &conn,
+            "codex-session-log",
+            "_codex_session",
+            "codex",
+            1002,
+            "codex_session",
+        )?;
+        seed_request_log_for_group_test(
+            &conn,
+            "gemini-session-log",
+            "_gemini_session",
+            "gemini",
+            1003,
+            "gemini_session",
+        )?;
+        seed_request_log_for_group_test(&conn, "codex-db-log", "p1", "codex", 1004, "codex_db")?;
+        seed_request_log_for_group_test(
+            &conn,
+            "unknown-other-log",
+            "p1",
+            "codex",
+            1005,
+            "unknown_custom_source",
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn test_get_usage_summary() -> Result<(), AppError> {
         let db = Database::memory()?;
@@ -1136,6 +1509,165 @@ mod tests {
         let summary = db.get_usage_summary(None, None, None)?;
         assert_eq!(summary.total_requests, 2);
         assert_eq!(summary.success_rate, 100.0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_usage_summary_excludes_session_sources() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let now = chrono::Utc::now().timestamp();
+        let rollup_date = chrono::DateTime::from_timestamp(now - 40 * 86400, 0)
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model,
+                    input_tokens, output_tokens, total_cost_usd,
+                    latency_ms, status_code, created_at, data_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    "proxy-detail",
+                    "p1",
+                    "codex",
+                    "gpt-5",
+                    100,
+                    50,
+                    "0.01",
+                    100,
+                    200,
+                    now,
+                    "proxy"
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model,
+                    input_tokens, output_tokens, total_cost_usd,
+                    latency_ms, status_code, created_at, data_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    "session-detail",
+                    "_codex_session",
+                    "codex",
+                    "gpt-5",
+                    1000,
+                    500,
+                    "0.10",
+                    100,
+                    200,
+                    now,
+                    "codex_session"
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO usage_daily_rollups (
+                    date, app_type, provider_id, model, request_count, success_count,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    total_cost_usd, avg_latency_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    rollup_date,
+                    "codex",
+                    "p2",
+                    "gpt-5",
+                    1,
+                    1,
+                    200,
+                    100,
+                    0,
+                    0,
+                    "0.02",
+                    120
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO usage_daily_rollups (
+                    date, app_type, provider_id, model, request_count, success_count,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    total_cost_usd, avg_latency_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    rollup_date,
+                    "codex",
+                    "_codex_session",
+                    "gpt-5",
+                    1,
+                    1,
+                    3000,
+                    1500,
+                    0,
+                    0,
+                    "0.30",
+                    120
+                ],
+            )?;
+        }
+
+        let summary = db.get_usage_summary(None, None, None)?;
+
+        assert_eq!(summary.total_requests, 2);
+        assert_eq!(summary.total_input_tokens, 300);
+        assert_eq!(summary.total_output_tokens, 150);
+        assert_eq!(summary.total_cost, "0.030000");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_usage_summary_backfills_zero_cost_proxy_logs() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let now = chrono::Utc::now().timestamp();
+
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT OR REPLACE INTO model_pricing (
+                    model_id, display_name, input_cost_per_million, output_cost_per_million,
+                    cache_read_cost_per_million, cache_creation_cost_per_million
+                ) VALUES (?, ?, ?, ?, ?, ?)",
+                params!["gpt-5.4-mini", "GPT-5.4 Mini", "0.75", "4.50", "0.075", "0"],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, total_cost_usd,
+                    latency_ms, status_code, created_at, data_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    "backfill-summary",
+                    "p1",
+                    "codex",
+                    "gpt-5.4-mini-2026-03-17",
+                    "gpt-5.4-mini",
+                    1_000_000,
+                    0,
+                    0,
+                    "0",
+                    100,
+                    200,
+                    now,
+                    "proxy"
+                ],
+            )?;
+        }
+
+        let summary = db.get_usage_summary(None, None, Some("codex"))?;
+
+        assert_eq!(summary.total_requests, 1);
+        assert_eq!(summary.total_cost, "0.750000");
+
+        let conn = lock_conn!(db.conn);
+        let persisted_cost: String = conn.query_row(
+            "SELECT total_cost_usd FROM proxy_request_logs WHERE request_id = ?1",
+            ["backfill-summary"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(persisted_cost, "0.750000");
 
         Ok(())
     }
@@ -1172,6 +1704,121 @@ mod tests {
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].model, "claude-3-sonnet");
         assert_eq!(stats[0].request_count, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_daily_trends_excludes_session_sources() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let now = chrono::Utc::now().timestamp();
+        let start = now - 3600;
+        let end = now + 3600;
+
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model,
+                    input_tokens, output_tokens, total_cost_usd,
+                    latency_ms, status_code, created_at, data_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    "proxy-trend",
+                    "p1",
+                    "codex",
+                    "gpt-5",
+                    120,
+                    30,
+                    "0.01",
+                    100,
+                    200,
+                    now,
+                    "proxy"
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model,
+                    input_tokens, output_tokens, total_cost_usd,
+                    latency_ms, status_code, created_at, data_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    "session-trend",
+                    "_codex_session",
+                    "codex",
+                    "gpt-5",
+                    1000,
+                    500,
+                    "0.10",
+                    100,
+                    200,
+                    now,
+                    "codex_session"
+                ],
+            )?;
+        }
+
+        let trends = db.get_daily_trends(Some(start), Some(end), None)?;
+        let total_requests: u64 = trends.iter().map(|stat| stat.request_count).sum();
+        let total_input_tokens: u64 = trends.iter().map(|stat| stat.total_input_tokens).sum();
+        let total_output_tokens: u64 = trends.iter().map(|stat| stat.total_output_tokens).sum();
+
+        assert_eq!(total_requests, 1);
+        assert_eq!(total_input_tokens, 120);
+        assert_eq!(total_output_tokens, 30);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_daily_trends_backfills_zero_cost_proxy_logs() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let now = chrono::Utc::now().timestamp();
+
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT OR REPLACE INTO model_pricing (
+                    model_id, display_name, input_cost_per_million, output_cost_per_million,
+                    cache_read_cost_per_million, cache_creation_cost_per_million
+                ) VALUES (?, ?, ?, ?, ?, ?)",
+                params!["gpt-5.4-mini", "GPT-5.4 Mini", "0.75", "4.50", "0.075", "0"],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, total_cost_usd,
+                    latency_ms, status_code, created_at, data_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    "backfill-trends",
+                    "p1",
+                    "codex",
+                    "gpt-5.4-mini-2026-03-17",
+                    "gpt-5.4-mini",
+                    1_000_000,
+                    0,
+                    0,
+                    "0",
+                    100,
+                    200,
+                    now,
+                    "proxy"
+                ],
+            )?;
+        }
+
+        let trends = db.get_daily_trends(Some(now - 60), Some(now + 60), Some("codex"))?;
+        let total_cost: f64 = trends
+            .iter()
+            .map(|stat| stat.total_cost.parse::<f64>().unwrap_or(0.0))
+            .sum();
+
+        assert!(
+            (total_cost - 0.75).abs() < 1e-9,
+            "expected 0.75, got {total_cost}"
+        );
 
         Ok(())
     }
@@ -1226,6 +1873,201 @@ mod tests {
         // 测试不存在的模型
         let result = find_model_pricing_row(&conn, "unknown-model-123")?;
         assert!(result.is_none(), "不应该匹配不存在的模型");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_log_source_classifier_contract() {
+        let cases = [
+            (None, RequestLogSourceKind::Proxy, &[][..]),
+            (Some("proxy"), RequestLogSourceKind::Proxy, &[][..]),
+            (
+                Some("session_log"),
+                RequestLogSourceKind::Session,
+                &["claude"][..],
+            ),
+            (
+                Some("codex_session"),
+                RequestLogSourceKind::Session,
+                &["codex"][..],
+            ),
+            (
+                Some("gemini_session"),
+                RequestLogSourceKind::Session,
+                &["gemini"][..],
+            ),
+            (
+                Some("codex_db"),
+                RequestLogSourceKind::Other,
+                &["codex"][..],
+            ),
+            (
+                Some("unknown_custom_source"),
+                RequestLogSourceKind::Other,
+                &[][..],
+            ),
+        ];
+
+        for (data_source, expected_kind, expected_apps) in cases {
+            let meta = classify_request_log_source(data_source);
+            assert_eq!(
+                meta.kind, expected_kind,
+                "unexpected kind for {data_source:?}"
+            );
+            assert_eq!(
+                meta.apps, expected_apps,
+                "unexpected apps for {data_source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_request_log_source_registry_integrity() {
+        for (source, meta) in REQUEST_LOG_SOURCE_REGISTRY {
+            match meta.kind {
+                RequestLogSourceKind::Session => {
+                    assert!(
+                        !meta.apps.is_empty(),
+                        "session source {source} must declare at least one app"
+                    );
+                }
+                RequestLogSourceKind::Proxy | RequestLogSourceKind::Other => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_request_logs_filters_by_source_group_proxy() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        seed_request_log_source_group_fixture(&db)?;
+
+        let result = db.get_request_logs(
+            &LogFilters {
+                source_group: Some("proxy".to_string()),
+                ..Default::default()
+            },
+            0,
+            20,
+        )?;
+
+        assert_eq!(result.total, 1);
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].request_id, "proxy-log");
+        assert_eq!(result.data[0].data_source.as_deref(), Some("proxy"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_request_logs_filters_by_source_group_session_and_app() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        seed_request_log_source_group_fixture(&db)?;
+
+        let session_result = db.get_request_logs(
+            &LogFilters {
+                source_group: Some("session".to_string()),
+                app_type: Some("all".to_string()),
+                ..Default::default()
+            },
+            0,
+            20,
+        )?;
+
+        assert_eq!(session_result.total, 3);
+        assert_eq!(session_result.data.len(), 3);
+        assert_eq!(
+            session_result
+                .data
+                .iter()
+                .map(|log| log.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "gemini-session-log",
+                "codex-session-log",
+                "claude-session-log"
+            ]
+        );
+        assert!(session_result
+            .data
+            .iter()
+            .all(
+                |log| classify_request_log_source(log.data_source.as_deref()).kind
+                    == RequestLogSourceKind::Session
+            ));
+
+        let codex_result = db.get_request_logs(
+            &LogFilters {
+                source_group: Some("session".to_string()),
+                app_type: Some("codex".to_string()),
+                ..Default::default()
+            },
+            0,
+            20,
+        )?;
+
+        assert_eq!(codex_result.total, 1);
+        assert_eq!(codex_result.data.len(), 1);
+        assert_eq!(codex_result.data[0].request_id, "codex-session-log");
+        assert_eq!(
+            codex_result.data[0].data_source.as_deref(),
+            Some("codex_session")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_request_logs_source_group_all_includes_other() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        seed_request_log_source_group_fixture(&db)?;
+
+        let result = db.get_request_logs(
+            &LogFilters {
+                source_group: Some("all".to_string()),
+                ..Default::default()
+            },
+            0,
+            20,
+        )?;
+
+        assert_eq!(result.total, 6);
+        assert_eq!(result.data.len(), 6);
+        assert!(result
+            .data
+            .iter()
+            .any(|log| log.data_source.as_deref() == Some("codex_db")));
+        assert!(result
+            .data
+            .iter()
+            .any(|log| log.data_source.as_deref() == Some("unknown_custom_source")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_request_logs_filters_by_session_provider_display_name() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        seed_request_log_source_group_fixture(&db)?;
+
+        let result = db.get_request_logs(
+            &LogFilters {
+                provider_name: Some("Codex (Session)".to_string()),
+                source_group: Some("session".to_string()),
+                app_type: Some("codex".to_string()),
+                ..Default::default()
+            },
+            0,
+            20,
+        )?;
+
+        assert_eq!(result.total, 1);
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].request_id, "codex-session-log");
+        assert_eq!(
+            result.data[0].provider_name.as_deref(),
+            Some("Codex (Session)")
+        );
 
         Ok(())
     }

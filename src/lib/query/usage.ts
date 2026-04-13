@@ -28,6 +28,7 @@ type RequestLogsKey = {
   appType?: string;
   providerName?: string;
   model?: string;
+  sourceGroup?: string;
   statusCode?: number;
 };
 
@@ -52,6 +53,7 @@ export const usageKeys = {
       key.appType ?? "",
       key.providerName ?? "",
       key.model ?? "",
+      key.sourceGroup ?? "",
       key.statusCode ?? -1,
       page,
       pageSize,
@@ -137,6 +139,7 @@ export function useRequestLogs({
     appType: filters.appType,
     providerName: filters.providerName,
     model: filters.model,
+    sourceGroup: filters.sourceGroup,
     statusCode: filters.statusCode,
   };
 
